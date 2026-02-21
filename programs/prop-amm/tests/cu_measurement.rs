@@ -1,14 +1,12 @@
 //! CU measurement and credit model verification tests.
 //!
 //! Requires compiled binaries:
-//! - `cargo build-sbf` in ref/prop-amm (produces prop_amm.so)
+//! - `cargo build-sbf` in prop-amm (produces prop_amm.so)
 //! - `cargo build-sbf` in c_u_soon workspace (produces c_u_soon_program.so)
 
 use bytemuck::{bytes_of, from_bytes};
 use c_u_later::{to_authority_wire_mask, to_program_wire_mask};
-use c_u_soon::{
-    Envelope, Mask, OracleState, StructMetadata, TypeHash, AUX_DATA_SIZE, ORACLE_BYTES,
-};
+use c_u_soon::{Envelope, OracleState, TypeHash, AUX_DATA_SIZE, ORACLE_BYTES};
 use mollusk_svm::program::create_program_account_loader_v3;
 use mollusk_svm::result::Check;
 use mollusk_svm::Mollusk;
@@ -41,7 +39,7 @@ const PROP_AMM_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/d
 
 const C_U_SOON_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../../target/deploy/c_u_soon_program"
+    "/../../../target/deploy/c_u_soon_program"
 );
 
 const PRICE_SCALE: u64 = 1_000_000_000;
