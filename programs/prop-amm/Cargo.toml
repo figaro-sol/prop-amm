@@ -13,10 +13,13 @@ default = []
 std = []
 
 [dependencies]
-pinocchio = { workspace = true }
-pinocchio-token = { workspace = true }
-pinocchio-system = { workspace = true }
+pinocchio = { workspace = true, features = ["cpi"] }
+c_u_soon = { path = "../../../../sdk", features = ["derive"] }
+c_u_later = { path = "../../../../c_u_later", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
+c_u_soon_cpi = { path = "../../../../cpi" }
 
 [dev-dependencies]
-mollusk-svm = "0.0.12"
-solana-sdk = "2.1"
+mollusk-svm = "0.10"
+mollusk-svm-programs-token = "0.10"
+solana-sdk = "3.0"

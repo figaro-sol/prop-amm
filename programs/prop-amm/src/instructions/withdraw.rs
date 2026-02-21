@@ -1,44 +1,38 @@
-//! Withdraw Instruction
-//!
-//! Authority withdraws tokens from the pool, decreasing liquidity.
-//! Supports both SPL Token and Token-2022 tokens.
-
 use pinocchio::{
-    account_info::AccountInfo, instruction::Signer, program_error::ProgramError, pubkey::Pubkey,
-    seeds, ProgramResult,
+    cpi::{Seed, Signer},
+    error::ProgramError,
+    AccountView, Address, ProgramResult,
 };
+
+use c_u_soon::{Envelope, AUX_DATA_SIZE};
+use c_u_soon_cpi::UpdateAuxiliary;
 
 use crate::{
     error::PropAmmError,
     pda::POOL_SEED,
-    state::Pool,
+    state::PropAmmAux,
     token::{get_mint_decimals, transfer_tokens},
 };
 
-use super::deposit::TokenSide;
+use super::TokenSide;
 
 /// Withdraw instruction data layout
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct WithdrawData {
-    /// Which token to withdraw
     pub side: TokenSide,
-    /// Amount to withdraw (native token units)
     pub amount: u64,
 }
 
 impl WithdrawData {
     pub const SIZE: usize = 1 + 8; // 9 bytes
 
-    /// Parse from bytes
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < Self::SIZE {
             return None;
         }
-
         let side = TokenSide::try_from_u8(data[0])?;
         let amount = u64::from_le_bytes(data[1..9].try_into().ok()?);
-
         Some(Self { side, amount })
     }
 }
@@ -46,151 +40,185 @@ impl WithdrawData {
 /// Process Withdraw instruction
 ///
 /// Accounts:
-/// 0. `[signer]` Authority - Must match pool.authority
-/// 1. `[writable]` Pool - Pool account
-/// 2. `[writable]` Authority Token Account - Authority's token account (destination)
-/// 3. `[writable]` Pool Vault - Pool's token account (source)
-/// 4. `[]` Mint - Token mint
-/// 5. `[]` Token Program - SPL Token or Token-2022
+///  0. [signer]    authority              — envelope authority
+///  1. [writable]  envelope               — c_u_soon envelope
+///  2. [writable]  authority_token_account — destination
+///  3. [writable]  vault                  — pool's token vault (source)
+///  4. []          mint
+///  5. []          token_program
+///  6. []          c_u_soon_program
+///  7. []          pool_authority_pda     — for PDA signing
 pub fn process_withdraw(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    _program_id: &Address,
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    // Parse instruction data
     let ix_data = WithdrawData::from_bytes(data).ok_or(ProgramError::InvalidInstructionData)?;
 
-    // Validate accounts
-    if accounts.len() < 6 {
+    if accounts.len() < 8 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
 
     let authority = &accounts[0];
-    let pool_account = &accounts[1];
+    let envelope_account = &accounts[1];
     let authority_token_account = &accounts[2];
-    let pool_vault = &accounts[3];
+    let vault = &accounts[3];
     let mint = &accounts[4];
     let token_program = &accounts[5];
+    let c_u_soon_program = &accounts[6];
+    let pool_authority_pda = &accounts[7];
 
-    // Authority must be signer
     if !authority.is_signer() {
         return Err(PropAmmError::NotSigner.into());
     }
-
-    // Validate writable accounts
-    if !pool_account.is_writable()
+    if !envelope_account.is_writable()
         || !authority_token_account.is_writable()
-        || !pool_vault.is_writable()
+        || !vault.is_writable()
     {
         return Err(PropAmmError::NotWritable.into());
     }
-
-    // Pool must be owned by this program
-    if unsafe { pool_account.owner() } != program_id {
-        return Err(PropAmmError::InvalidOwner.into());
-    }
-
-    // Validate amount
     if ix_data.amount == 0 {
         return Err(PropAmmError::ZeroAmount.into());
     }
 
-    // Load pool
-    let pool_data = pool_account.try_borrow_data()?;
-    if pool_data.len() < Pool::SIZE {
-        return Err(PropAmmError::AccountDataTooSmall.into());
+    // Envelope must be owned by c_u_soon program
+    if !envelope_account.owned_by(c_u_soon_program.address()) {
+        return Err(PropAmmError::InvalidOwner.into());
     }
 
-    let mut pool = Pool::from_bytes(&pool_data).ok_or(PropAmmError::InvalidDiscriminator)?;
-
-    if !pool.is_valid_discriminator() {
-        return Err(PropAmmError::InvalidDiscriminator.into());
+    // Read envelope
+    let envelope_data = envelope_account.try_borrow()?;
+    if envelope_data.len() < Envelope::SIZE {
+        return Err(PropAmmError::InvalidEnvelope.into());
     }
+    let envelope: &Envelope = bytemuck::from_bytes(&envelope_data[..Envelope::SIZE]);
 
     // Verify authority
-    if authority.key() != &pool.authority {
+    if authority.address() != &envelope.authority {
         return Err(PropAmmError::Unauthorized.into());
     }
 
-    // Validate mint and vault match the side, check sufficient withdrawable quantity
-    // Can only withdraw total_quantity - consumed (consumed represents traded liquidity)
+    // Read aux state
+    let aux: &PropAmmAux = envelope
+        .aux::<PropAmmAux>()
+        .ok_or(PropAmmError::InvalidEnvelope)?;
+
+    // Validate pool_authority_pda
+    if pool_authority_pda.address() != &envelope.delegation_authority {
+        return Err(PropAmmError::InvalidPda.into());
+    }
+
+    // Validate mint, vault, and withdrawable amount
     match ix_data.side {
         TokenSide::Base => {
-            if mint.key() != &pool.base_mint {
+            if mint.address().as_ref() != &aux.base_mint {
                 return Err(PropAmmError::InvalidMint.into());
             }
-            if pool_vault.key() != &pool.base_vault {
+            if vault.address().as_ref() != &aux.base_vault {
                 return Err(PropAmmError::InvalidTokenAccount.into());
             }
-            // Check that we have enough withdrawable liquidity
-            let withdrawable = pool.ask_side.total_quantity.saturating_sub(pool.ask_side.consumed);
+            let effective = aux
+                .ask_total_size
+                .checked_add(aux.ask_credit)
+                .ok_or(PropAmmError::MathOverflow)?;
+            let withdrawable = effective
+                .checked_sub(aux.ask_accumulated)
+                .ok_or(PropAmmError::MathOverflow)?;
             if withdrawable < ix_data.amount {
                 return Err(PropAmmError::InsufficientFunds.into());
             }
         }
         TokenSide::Quote => {
-            if mint.key() != &pool.quote_mint {
+            if mint.address().as_ref() != &aux.quote_mint {
                 return Err(PropAmmError::InvalidMint.into());
             }
-            if pool_vault.key() != &pool.quote_vault {
+            if vault.address().as_ref() != &aux.quote_vault {
                 return Err(PropAmmError::InvalidTokenAccount.into());
             }
-            // Check that we have enough withdrawable liquidity
-            let withdrawable = pool.bid_side.total_quantity.saturating_sub(pool.bid_side.consumed);
+            let effective = aux
+                .bid_total_size
+                .checked_add(aux.bid_credit)
+                .ok_or(PropAmmError::MathOverflow)?;
+            let withdrawable = effective
+                .checked_sub(aux.bid_accumulated)
+                .ok_or(PropAmmError::MathOverflow)?;
             if withdrawable < ix_data.amount {
                 return Err(PropAmmError::InsufficientFunds.into());
             }
         }
     }
 
-    // Get decimals for transfer_checked
+    // Copy mutable state and read sequence before dropping borrow
+    let mut updated_aux: PropAmmAux = *aux;
+    let authority_aux_sequence = envelope.authority_aux_sequence;
+
+    // Get decimals
     let decimals = get_mint_decimals(mint)?;
 
-    drop(pool_data);
+    // Drop borrow before CPI
+    drop(envelope_data);
 
-    // Update pool state - decrease total_quantity
+    // Update total_size
     match ix_data.side {
         TokenSide::Base => {
-            pool.ask_side.total_quantity = pool
-                .ask_side
-                .total_quantity
+            updated_aux.ask_total_size = updated_aux
+                .ask_total_size
                 .checked_sub(ix_data.amount)
                 .ok_or(PropAmmError::MathOverflow)?;
         }
         TokenSide::Quote => {
-            pool.bid_side.total_quantity = pool
-                .bid_side
-                .total_quantity
+            updated_aux.bid_total_size = updated_aux
+                .bid_total_size
                 .checked_sub(ix_data.amount)
                 .ok_or(PropAmmError::MathOverflow)?;
         }
     }
 
-    // Write updated pool state
-    let pool_bytes = pool.to_bytes();
-    let mut pool_data = pool_account.try_borrow_mut_data()?;
-    pool_data[..Pool::SIZE].copy_from_slice(&pool_bytes);
-    drop(pool_data);
-
-    // Transfer tokens from vault to authority (requires PDA signing)
-    let bump_seed = [pool.bump];
-    let pool_signer_seeds = seeds!(
-        POOL_SEED,
-        pool.base_mint.as_ref(),
-        pool.quote_mint.as_ref(),
-        &bump_seed
-    );
+    // Token transfer: vault → authority (pool_authority_pda signs)
+    let bump_seed = [updated_aux.pool_authority_bump];
+    let pool_signer_seeds = [
+        Seed::from(POOL_SEED),
+        Seed::from(&updated_aux.base_mint),
+        Seed::from(&updated_aux.quote_mint),
+        Seed::from(&bump_seed),
+    ];
+    let signer = Signer::from(&pool_signer_seeds);
 
     transfer_tokens(
-        pool_vault,
+        vault,
         authority_token_account,
-        pool_account,
+        pool_authority_pda,
         mint,
         token_program,
         ix_data.amount,
         decimals,
-        &[Signer::from(&pool_signer_seeds)],
+        &[signer],
     )?;
 
-    Ok(())
+    // CPI to c_u_soon: UpdateAuxiliary (authority path)
+    let cpi_sequence = authority_aux_sequence
+        .checked_add(1)
+        .ok_or(PropAmmError::MathOverflow)?;
+
+    let mut cpi_aux_data = [0u8; AUX_DATA_SIZE];
+    let aux_bytes = bytemuck::bytes_of(&updated_aux);
+    cpi_aux_data[..aux_bytes.len()].copy_from_slice(aux_bytes);
+
+    let pool_signer_seeds2 = [
+        Seed::from(POOL_SEED),
+        Seed::from(&updated_aux.base_mint),
+        Seed::from(&updated_aux.quote_mint),
+        Seed::from(&bump_seed),
+    ];
+    let cpi_signer = Signer::from(&pool_signer_seeds2);
+
+    UpdateAuxiliary {
+        authority,
+        envelope: envelope_account,
+        pda: pool_authority_pda,
+        program: c_u_soon_program,
+        sequence: cpi_sequence,
+        data: &cpi_aux_data,
+    }
+    .invoke_signed(&[cpi_signer])
 }
