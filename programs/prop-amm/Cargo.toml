@@ -14,10 +14,10 @@ std = []
 
 [dependencies]
 pinocchio = { workspace = true, features = ["cpi"] }
-c_u_soon = { path = "../../../sdk", features = ["derive"] }
-c_u_later = { path = "../../../c_u_later", features = ["derive"] }
+c_u_soon = { path = "../../c_u_soon/sdk", features = ["derive"] }
+c_u_later = { path = "../../c_u_soon/c_u_later", features = ["derive"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
-c_u_soon_cpi = { path = "../../../cpi" }
+c_u_soon_cpi = { path = "../../c_u_soon/cpi" }
 
 [dev-dependencies]
 mollusk-svm = "0.10"
