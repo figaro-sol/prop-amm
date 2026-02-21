@@ -52,7 +52,11 @@ impl SwapData {
         let direction = SwapDirection::try_from_u8(data[0])?;
         let amount_in = u64::from_le_bytes(data[1..9].try_into().ok()?);
         let min_amount_out = u64::from_le_bytes(data[9..17].try_into().ok()?);
-        Some(Self { direction, amount_in, min_amount_out })
+        Some(Self {
+            direction,
+            amount_in,
+            min_amount_out,
+        })
     }
 }
 
@@ -72,11 +76,7 @@ impl SwapData {
 /// 10. []          c_u_soon_program
 /// 11. []          pool_authority_pda   — delegation_authority, for PDA signing
 /// 12. []          padding              — for c_u_soon CPI
-pub fn process_swap(
-    _program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-) -> ProgramResult {
+pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let ix_data = SwapData::from_bytes(data).ok_or(ProgramError::InvalidInstructionData)?;
 
     if accounts.len() < 13 {
@@ -269,29 +269,49 @@ pub fn process_swap(
         SwapDirection::BuyBaseWithQuote => {
             // User sends quote to vault (user signs)
             transfer_tokens(
-                user_quote_account, quote_vault, user,
-                quote_mint, quote_token_program,
-                transfer_in_amount, quote_decimals, &[],
+                user_quote_account,
+                quote_vault,
+                user,
+                quote_mint,
+                quote_token_program,
+                transfer_in_amount,
+                quote_decimals,
+                &[],
             )?;
             // Vault sends base to user (pool_authority_pda signs)
             transfer_tokens(
-                base_vault, user_base_account, pool_authority_pda,
-                base_mint, base_token_program,
-                transfer_out_amount, base_decimals, &[signer],
+                base_vault,
+                user_base_account,
+                pool_authority_pda,
+                base_mint,
+                base_token_program,
+                transfer_out_amount,
+                base_decimals,
+                &[signer],
             )?;
         }
         SwapDirection::SellBaseForQuote => {
             // User sends base to vault (user signs)
             transfer_tokens(
-                user_base_account, base_vault, user,
-                base_mint, base_token_program,
-                transfer_in_amount, base_decimals, &[],
+                user_base_account,
+                base_vault,
+                user,
+                base_mint,
+                base_token_program,
+                transfer_in_amount,
+                base_decimals,
+                &[],
             )?;
             // Vault sends quote to user (pool_authority_pda signs)
             transfer_tokens(
-                quote_vault, user_quote_account, pool_authority_pda,
-                quote_mint, quote_token_program,
-                transfer_out_amount, quote_decimals, &[signer],
+                quote_vault,
+                user_quote_account,
+                pool_authority_pda,
+                quote_mint,
+                quote_token_program,
+                transfer_out_amount,
+                quote_decimals,
+                &[signer],
             )?;
         }
     }

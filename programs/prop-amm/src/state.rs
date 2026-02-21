@@ -21,36 +21,36 @@ pub struct PropAmmQuote {
 #[repr(C)]
 pub struct PropAmmAux {
     // No marks: settable only via ForceUpdate (both signers)
-    pub base_mint: [u8; 32],      // 0..32
-    pub quote_mint: [u8; 32],     // 32..64
-    pub base_vault: [u8; 32],     // 64..96
-    pub quote_vault: [u8; 32],    // 96..128
+    pub base_mint: [u8; 32],   // 0..32
+    pub quote_mint: [u8; 32],  // 32..64
+    pub base_vault: [u8; 32],  // 64..96
+    pub quote_vault: [u8; 32], // 96..128
 
     // #[authority]: liquidity management
     #[authority]
-    pub bid_total_size: u64,      // 128..136
+    pub bid_total_size: u64, // 128..136
     #[authority]
-    pub ask_total_size: u64,      // 136..144
+    pub ask_total_size: u64, // 136..144
     #[authority]
-    pub is_active: u8,            // 144
+    pub is_active: u8, // 144
     #[authority]
-    pub _pad_active: [u8; 7],     // 145..152
+    pub _pad_active: [u8; 7], // 145..152
 
     // #[program]: swap-mutated state
     #[program]
-    pub bid_credit: u64,          // 152..160
+    pub bid_credit: u64, // 152..160
     #[program]
-    pub bid_accumulated: u64,     // 160..168
+    pub bid_accumulated: u64, // 160..168
     #[program]
-    pub ask_credit: u64,          // 168..176
+    pub ask_credit: u64, // 168..176
     #[program]
-    pub ask_accumulated: u64,     // 176..184
+    pub ask_accumulated: u64, // 176..184
     #[program]
-    pub accumulated_at_seq: u64,  // 184..192
+    pub accumulated_at_seq: u64, // 184..192
 
     // No mark: immutable after ForceUpdate
-    pub pool_authority_bump: u8,  // 192
-    pub _pad_bump: [u8; 7],       // 193..200
+    pub pool_authority_bump: u8, // 192
+    pub _pad_bump: [u8; 7],      // 193..200
 }
 
 const _: () = assert!(core::mem::size_of::<PropAmmQuote>() == 112);
@@ -105,15 +105,27 @@ mod tests {
         }
         // Immutable fields should be blocked
         for i in 0..128 {
-            assert!(!mask.is_writable(i), "byte {} should be blocked for program", i);
+            assert!(
+                !mask.is_writable(i),
+                "byte {} should be blocked for program",
+                i
+            );
         }
         // Authority fields should be blocked for program
         for i in 128..152 {
-            assert!(!mask.is_writable(i), "byte {} should be blocked for program", i);
+            assert!(
+                !mask.is_writable(i),
+                "byte {} should be blocked for program",
+                i
+            );
         }
         // pool_authority_bump + padding should be blocked
         for i in 192..200 {
-            assert!(!mask.is_writable(i), "byte {} should be blocked for program", i);
+            assert!(
+                !mask.is_writable(i),
+                "byte {} should be blocked for program",
+                i
+            );
         }
     }
 
@@ -123,15 +135,27 @@ mod tests {
         // bid_total_size (128..136), ask_total_size (136..144),
         // is_active (144), _pad_active (145..152) should be writable
         for i in 128..152 {
-            assert!(mask.is_writable(i), "byte {} should be authority-writable", i);
+            assert!(
+                mask.is_writable(i),
+                "byte {} should be authority-writable",
+                i
+            );
         }
         // Immutable fields should be blocked
         for i in 0..128 {
-            assert!(!mask.is_writable(i), "byte {} should be blocked for authority", i);
+            assert!(
+                !mask.is_writable(i),
+                "byte {} should be blocked for authority",
+                i
+            );
         }
         // Program fields should be blocked for authority
         for i in 152..192 {
-            assert!(!mask.is_writable(i), "byte {} should be blocked for authority", i);
+            assert!(
+                !mask.is_writable(i),
+                "byte {} should be blocked for authority",
+                i
+            );
         }
     }
 }
