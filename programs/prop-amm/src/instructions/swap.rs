@@ -11,7 +11,7 @@ use crate::{
     error::PropAmmError,
     math::{buy_base_piecewise, sell_base_piecewise},
     pda::POOL_SEED,
-    state::{PropAmmAux, PropAmmQuote},
+    state::{PropAmmAux, PropAmmAuxProgram, PropAmmQuote},
     token::{get_mint_decimals, transfer_tokens},
 };
 
@@ -165,90 +165,94 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     let oracle_sequence = envelope.oracle_state.sequence;
     let program_aux_sequence = envelope.program_aux_sequence;
 
-    // Oracle freshness: reset credit/accumulated on new oracle sequence
-    if oracle_sequence > updated_aux.accumulated_at_seq {
-        updated_aux.bid_credit = 0;
-        updated_aux.bid_accumulated = 0;
-        updated_aux.ask_credit = 0;
-        updated_aux.ask_accumulated = 0;
-        updated_aux.accumulated_at_seq = oracle_sequence;
-    }
-
     // Get decimals before dropping borrow
     let base_decimals = get_mint_decimals(base_mint)?;
     let quote_decimals = get_mint_decimals(quote_mint)?;
 
-    // Execute swap
-    let (transfer_in_amount, transfer_out_amount) = match ix_data.direction {
-        SwapDirection::BuyBaseWithQuote => {
-            // User spends quote to buy base (consumes ask side)
-            let effective_total = updated_aux
-                .ask_total_size
-                .checked_add(updated_aux.ask_credit)
-                .ok_or(PropAmmError::MathOverflow)?;
+    // Execute swap through typed wrapper (program-only field access)
+    let (transfer_in_amount, transfer_out_amount) = {
+        let mut aux_w = PropAmmAuxProgram::from_mut(&mut updated_aux);
 
-            let (base_bought, quote_used, new_consumed) = buy_base_piecewise(
-                ix_data.amount_in,
-                &quote.ask_prices,
-                effective_total,
-                updated_aux.ask_accumulated,
-            )
-            .ok_or(PropAmmError::MathOverflow)?;
-
-            if base_bought < ix_data.min_amount_out {
-                return Err(PropAmmError::SlippageExceeded.into());
-            }
-
-            updated_aux.ask_accumulated = new_consumed;
-            if quote_used > 0 {
-                if updated_aux.bid_accumulated >= quote_used {
-                    updated_aux.bid_accumulated -= quote_used;
-                } else {
-                    let remainder = quote_used - updated_aux.bid_accumulated;
-                    updated_aux.bid_accumulated = 0;
-                    updated_aux.bid_credit = updated_aux
-                        .bid_credit
-                        .checked_add(remainder)
-                        .ok_or(PropAmmError::MathOverflow)?;
-                }
-            }
-
-            (quote_used, base_bought)
+        // Oracle freshness: reset credit/accumulated on new oracle sequence
+        if oracle_sequence > aux_w.accumulated_at_seq {
+            *aux_w.bid_credit_mut() = 0;
+            *aux_w.bid_accumulated_mut() = 0;
+            *aux_w.ask_credit_mut() = 0;
+            *aux_w.ask_accumulated_mut() = 0;
+            *aux_w.accumulated_at_seq_mut() = oracle_sequence;
         }
-        SwapDirection::SellBaseForQuote => {
-            // User sells base for quote (consumes bid side)
-            let effective_total = updated_aux
-                .bid_total_size
-                .checked_add(updated_aux.bid_credit)
+
+        match ix_data.direction {
+            SwapDirection::BuyBaseWithQuote => {
+                // User spends quote to buy base (consumes ask side)
+                let effective_total = aux_w
+                    .ask_total_size
+                    .checked_add(aux_w.ask_credit)
+                    .ok_or(PropAmmError::MathOverflow)?;
+
+                let (base_bought, quote_used, new_consumed) = buy_base_piecewise(
+                    ix_data.amount_in,
+                    &quote.ask_prices,
+                    effective_total,
+                    aux_w.ask_accumulated,
+                )
                 .ok_or(PropAmmError::MathOverflow)?;
 
-            let (quote_received, base_used, new_consumed) = sell_base_piecewise(
-                ix_data.amount_in,
-                &quote.bid_prices,
-                effective_total,
-                updated_aux.bid_accumulated,
-            )
-            .ok_or(PropAmmError::MathOverflow)?;
-
-            if quote_received < ix_data.min_amount_out {
-                return Err(PropAmmError::SlippageExceeded.into());
-            }
-
-            updated_aux.bid_accumulated = new_consumed;
-            if base_used > 0 {
-                if updated_aux.ask_accumulated >= base_used {
-                    updated_aux.ask_accumulated -= base_used;
-                } else {
-                    let remainder = base_used - updated_aux.ask_accumulated;
-                    updated_aux.ask_accumulated = 0;
-                    updated_aux.ask_credit = updated_aux
-                        .ask_credit
-                        .checked_add(remainder)
-                        .ok_or(PropAmmError::MathOverflow)?;
+                if base_bought < ix_data.min_amount_out {
+                    return Err(PropAmmError::SlippageExceeded.into());
                 }
-            }
 
-            (base_used, quote_received)
+                *aux_w.ask_accumulated_mut() = new_consumed;
+                if quote_used > 0 {
+                    if aux_w.bid_accumulated >= quote_used {
+                        *aux_w.bid_accumulated_mut() -= quote_used;
+                    } else {
+                        let remainder = quote_used - aux_w.bid_accumulated;
+                        *aux_w.bid_accumulated_mut() = 0;
+                        *aux_w.bid_credit_mut() = aux_w
+                            .bid_credit
+                            .checked_add(remainder)
+                            .ok_or(PropAmmError::MathOverflow)?;
+                    }
+                }
+
+                (quote_used, base_bought)
+            }
+            SwapDirection::SellBaseForQuote => {
+                // User sells base for quote (consumes bid side)
+                let effective_total = aux_w
+                    .bid_total_size
+                    .checked_add(aux_w.bid_credit)
+                    .ok_or(PropAmmError::MathOverflow)?;
+
+                let (quote_received, base_used, new_consumed) = sell_base_piecewise(
+                    ix_data.amount_in,
+                    &quote.bid_prices,
+                    effective_total,
+                    aux_w.bid_accumulated,
+                )
+                .ok_or(PropAmmError::MathOverflow)?;
+
+                if quote_received < ix_data.min_amount_out {
+                    return Err(PropAmmError::SlippageExceeded.into());
+                }
+
+                *aux_w.bid_accumulated_mut() = new_consumed;
+                if base_used > 0 {
+                    if aux_w.ask_accumulated >= base_used {
+                        *aux_w.ask_accumulated_mut() -= base_used;
+                    } else {
+                        let remainder = base_used - aux_w.ask_accumulated;
+                        *aux_w.ask_accumulated_mut() = 0;
+                        *aux_w.ask_credit_mut() = aux_w
+                            .ask_credit
+                            .checked_add(remainder)
+                            .ok_or(PropAmmError::MathOverflow)?;
+                    }
+                }
+
+                (base_used, quote_received)
+            }
         }
     };
 

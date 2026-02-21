@@ -10,7 +10,7 @@ use c_u_soon_cpi::UpdateAuxiliary;
 use crate::{
     error::PropAmmError,
     pda::POOL_SEED,
-    state::PropAmmAux,
+    state::{PropAmmAux, PropAmmAuxAuthority},
     token::{get_mint_decimals, transfer_tokens},
 };
 
@@ -158,19 +158,22 @@ pub fn process_withdraw(
     // Drop borrow before CPI
     drop(envelope_data);
 
-    // Update total_size
-    match ix_data.side {
-        TokenSide::Base => {
-            updated_aux.ask_total_size = updated_aux
-                .ask_total_size
-                .checked_sub(ix_data.amount)
-                .ok_or(PropAmmError::MathOverflow)?;
-        }
-        TokenSide::Quote => {
-            updated_aux.bid_total_size = updated_aux
-                .bid_total_size
-                .checked_sub(ix_data.amount)
-                .ok_or(PropAmmError::MathOverflow)?;
+    // Update total_size through typed wrapper (authority-only field access)
+    {
+        let mut aux_w = PropAmmAuxAuthority::from_mut(&mut updated_aux);
+        match ix_data.side {
+            TokenSide::Base => {
+                *aux_w.ask_total_size_mut() = aux_w
+                    .ask_total_size
+                    .checked_sub(ix_data.amount)
+                    .ok_or(PropAmmError::MathOverflow)?;
+            }
+            TokenSide::Quote => {
+                *aux_w.bid_total_size_mut() = aux_w
+                    .bid_total_size
+                    .checked_sub(ix_data.amount)
+                    .ok_or(PropAmmError::MathOverflow)?;
+            }
         }
     }
 
