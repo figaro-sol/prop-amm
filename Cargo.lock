@@ -576,7 +576,6 @@ dependencies = [
  "c_u_soon",
  "c_u_soon_instruction",
  "pinocchio",
- "wincode 0.2.5",
 ]
 
 [[package]]

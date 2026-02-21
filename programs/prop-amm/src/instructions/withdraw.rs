@@ -4,8 +4,8 @@ use pinocchio::{
     AccountView, Address, ProgramResult,
 };
 
-use c_u_soon::{Envelope, AUX_DATA_SIZE};
-use c_u_soon_cpi::UpdateAuxiliary;
+use c_u_soon::{Envelope, TypeHash};
+use c_u_soon_cpi::{next_sequence, UpdateAuxiliary};
 
 use crate::{
     error::PropAmmError,
@@ -199,13 +199,7 @@ pub fn process_withdraw(
     )?;
 
     // CPI to c_u_soon: UpdateAuxiliary (authority path)
-    let cpi_sequence = authority_aux_sequence
-        .checked_add(1)
-        .ok_or(PropAmmError::MathOverflow)?;
-
-    let mut cpi_aux_data = [0u8; AUX_DATA_SIZE];
-    let aux_bytes = bytemuck::bytes_of(&updated_aux);
-    cpi_aux_data[..aux_bytes.len()].copy_from_slice(aux_bytes);
+    let cpi_sequence = next_sequence(authority_aux_sequence)?;
 
     let pool_signer_seeds2 = [
         Seed::from(POOL_SEED),
@@ -220,8 +214,9 @@ pub fn process_withdraw(
         envelope: envelope_account,
         pda: pool_authority_pda,
         program: c_u_soon_program,
+        metadata: PropAmmAux::METADATA.as_u64(),
         sequence: cpi_sequence,
-        data: &cpi_aux_data,
+        data: bytemuck::bytes_of(&updated_aux),
     }
     .invoke_signed(&[cpi_signer])
 }

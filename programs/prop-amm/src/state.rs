@@ -56,7 +56,6 @@ pub struct PropAmmAux {
 const _: () = assert!(core::mem::size_of::<PropAmmQuote>() == 112);
 const _: () = assert!(core::mem::size_of::<PropAmmAux>() == 200);
 const _: () = assert!(core::mem::size_of::<PropAmmQuote>() <= 239);
-const _: () = assert!(core::mem::size_of::<PropAmmAux>() <= 255);
 
 /// Local computation struct for swap math.
 /// Not stored on-chain — constructed from aux fields + oracle prices.

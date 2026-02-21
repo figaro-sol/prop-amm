@@ -13,8 +13,8 @@ A piecewise linear AMM for Solana implementing the [Prop AMM model](https://bene
 - **Oracle sets prices only** - Quantities determined by on-chain state (deposits, withdrawals, swaps)
 - **Consumed-based tracking** - Proportional scaling maintains curve position when liquidity changes
 - **u64 with 10^9 scaling** - Efficient native operations
-- **Zero dependencies** - Pinocchio framework
-- **Ultra-low CU oracle updates** - ~150 CUs
+- **One external framework dependency** - Pinocchio
+- **Lower-CU oracle updates** - ~39 CUs via c_u_soon fast path
 
 ## On-Chain Data Structure
 
@@ -159,8 +159,8 @@ This means:
 # Build for Solana
 cargo build-sbf
 
-# Run tests
-cargo test
+# Run prop-amm tests
+make test
 
 # Deploy to mainnet
 solana program deploy target/deploy/prop_amm.so \

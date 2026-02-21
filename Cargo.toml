@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["programs/prop-amm"]
+exclude = ["c_u_soon"]
 
 [workspace.dependencies]
 pinocchio = { git = "ssh://git@github.com/figaro-sol/pinocchio.git", branch = "small_oracle" }

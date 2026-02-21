@@ -174,6 +174,14 @@ fn create_swap_data(direction: u8, amount_in: u64, min_out: u64) -> Vec<u8> {
     data
 }
 
+fn create_fast_path_update_data(sequence: u64, quote: &PropAmmQuote) -> Vec<u8> {
+    let mut data = Vec::with_capacity(16 + core::mem::size_of::<PropAmmQuote>());
+    data.extend_from_slice(&PropAmmQuote::METADATA.as_u64().to_le_bytes());
+    data.extend_from_slice(&sequence.to_le_bytes());
+    data.extend_from_slice(bytes_of(quote));
+    data
+}
+
 fn default_quote() -> PropAmmQuote {
     PropAmmQuote {
         bid_prices: BID_PRICES,
@@ -260,6 +268,7 @@ impl SwapSetup {
 
         vec![
             (self.user, create_funded_account(1_000_000_000)),
+            (self.authority, create_funded_account(1_000_000_000)),
             (self.envelope_key, envelope),
             (
                 self.user_base_key,
@@ -311,6 +320,17 @@ impl SwapSetup {
         )
     }
 
+    fn build_oracle_fast_update_instruction(&self, sequence: u64, quote: &PropAmmQuote) -> Instruction {
+        Instruction::new_with_bytes(
+            C_U_SOON_ID,
+            &create_fast_path_update_data(sequence, quote),
+            vec![
+                AccountMeta::new_readonly(self.authority, true),
+                AccountMeta::new(self.envelope_key, false),
+            ],
+        )
+    }
+
     fn default_aux(&self) -> PropAmmAux {
         default_aux(
             &self.base_mint_key,
@@ -334,6 +354,51 @@ fn read_aux_from_result(
 
     let envelope: &Envelope = from_bytes(&envelope_account.data[..Envelope::SIZE]);
     *envelope.aux::<PropAmmAux>().expect("aux decode failed")
+}
+
+fn read_quote_from_result(
+    result: &mollusk_svm::result::InstructionResult,
+    envelope_key: &Address,
+) -> PropAmmQuote {
+    let (_, envelope_account) = result
+        .resulting_accounts
+        .iter()
+        .find(|(k, _)| k == envelope_key)
+        .expect("envelope not found in resulting accounts");
+
+    let envelope: &Envelope = from_bytes(&envelope_account.data[..Envelope::SIZE]);
+    *envelope.oracle::<PropAmmQuote>().expect("quote decode failed")
+}
+
+fn read_oracle_sequence_from_result(
+    result: &mollusk_svm::result::InstructionResult,
+    envelope_key: &Address,
+) -> u64 {
+    let (_, envelope_account) = result
+        .resulting_accounts
+        .iter()
+        .find(|(k, _)| k == envelope_key)
+        .expect("envelope not found in resulting accounts");
+
+    let envelope: &Envelope = from_bytes(&envelope_account.data[..Envelope::SIZE]);
+    envelope.oracle_state.sequence
+}
+
+fn read_token_amount_from_result(
+    result: &mollusk_svm::result::InstructionResult,
+    token_account_key: &Address,
+) -> u64 {
+    let (_, token_account) = result
+        .resulting_accounts
+        .iter()
+        .find(|(k, _)| k == token_account_key)
+        .expect("token account not found in resulting accounts");
+
+    u64::from_le_bytes(
+        token_account.data[64..72]
+            .try_into()
+            .expect("token account amount slice"),
+    )
 }
 
 // -- Tests --
@@ -489,4 +554,67 @@ fn test_swap_credit_model() {
         quote_received, base_used
     );
     println!("========================================");
+}
+
+#[test]
+fn test_oracle_fast_path_update_then_swap_uses_new_prices() {
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let aux = setup.default_aux();
+    let accounts = setup.build_accounts(&aux);
+
+    let updated_quote = PropAmmQuote {
+        bid_prices: BID_PRICES,
+        ask_prices: [
+            301 * PRICE_SCALE,
+            302 * PRICE_SCALE,
+            303 * PRICE_SCALE,
+            304 * PRICE_SCALE,
+            305 * PRICE_SCALE,
+            306 * PRICE_SCALE,
+            307 * PRICE_SCALE,
+        ],
+    };
+
+    let update_ix = setup.build_oracle_fast_update_instruction(2, &updated_quote);
+    let quote_in: u64 = 100_000_000; // 100 USDC
+    let swap_ix = setup.build_swap_instruction(0, quote_in, 0);
+
+    let result = mollusk.process_and_validate_instruction_chain(
+        &[
+            (&update_ix, &[Check::success()]),
+            (&swap_ix, &[Check::success()]),
+        ],
+        &accounts,
+    );
+
+    let final_quote = read_quote_from_result(&result, &setup.envelope_key);
+    let final_aux = read_aux_from_result(&result, &setup.envelope_key);
+    let final_oracle_sequence = read_oracle_sequence_from_result(&result, &setup.envelope_key);
+    let user_base_amount = read_token_amount_from_result(&result, &setup.user_base_key);
+
+    let (expected_base_out_new, quote_used, expected_ask_acc) =
+        buy_base_piecewise(quote_in, &updated_quote.ask_prices, ASK_TOTAL_SIZE, 0)
+            .expect("new quote math should succeed");
+    let (expected_base_out_old, _, _) = buy_base_piecewise(quote_in, &ASK_PRICES, ASK_TOTAL_SIZE, 0)
+        .expect("old quote math should succeed");
+
+    assert_eq!(final_quote, updated_quote, "oracle quote should be fast-path updated");
+    assert_eq!(final_oracle_sequence, 2, "oracle sequence should advance via c_u_soon");
+    assert_eq!(
+        user_base_amount,
+        100_000_000_000 + expected_base_out_new,
+        "swap should use updated ask prices for base output",
+    );
+    assert!(
+        expected_base_out_new < expected_base_out_old,
+        "higher ask prices should reduce base output",
+    );
+
+    assert_eq!(
+        final_aux.accumulated_at_seq, 2,
+        "swap should track latest oracle sequence",
+    );
+    assert_eq!(final_aux.ask_accumulated, expected_ask_acc);
+    assert_eq!(final_aux.bid_credit, quote_used);
 }

@@ -4,8 +4,8 @@ use pinocchio::{
     AccountView, Address, ProgramResult,
 };
 
-use c_u_soon::{Envelope, AUX_DATA_SIZE};
-use c_u_soon_cpi::UpdateAuxiliaryDelegated;
+use c_u_soon::{Envelope, TypeHash};
+use c_u_soon_cpi::{next_sequence, UpdateAuxiliaryDelegated};
 
 use crate::{
     error::PropAmmError,
@@ -75,11 +75,10 @@ impl SwapData {
 ///  9. []          quote_token_program
 /// 10. []          c_u_soon_program
 /// 11. []          pool_authority_pda   — delegation_authority, for PDA signing
-/// 12. []          padding              — for c_u_soon CPI
 pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let ix_data = SwapData::from_bytes(data).ok_or(ProgramError::InvalidInstructionData)?;
 
-    if accounts.len() < 13 {
+    if accounts.len() < 12 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
 
@@ -95,7 +94,6 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     let quote_token_program = &accounts[9];
     let c_u_soon_program = &accounts[10];
     let pool_authority_pda = &accounts[11];
-    let padding = &accounts[12];
 
     if !user.is_signer() {
         return Err(PropAmmError::NotSigner.into());
@@ -321,13 +319,7 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     }
 
     // CPI to c_u_soon: UpdateAuxiliaryDelegated
-    let cpi_sequence = program_aux_sequence
-        .checked_add(1)
-        .ok_or(PropAmmError::MathOverflow)?;
-
-    let mut cpi_aux_data = [0u8; AUX_DATA_SIZE];
-    let aux_bytes = bytemuck::bytes_of(&updated_aux);
-    cpi_aux_data[..aux_bytes.len()].copy_from_slice(aux_bytes);
+    let cpi_sequence = next_sequence(program_aux_sequence)?;
 
     let pool_signer_seeds2 = [
         Seed::from(POOL_SEED),
@@ -340,10 +332,11 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     UpdateAuxiliaryDelegated {
         envelope: envelope_account,
         delegation_auth: pool_authority_pda,
-        padding,
+        padding: user,
         program: c_u_soon_program,
+        metadata: PropAmmAux::METADATA.as_u64(),
         sequence: cpi_sequence,
-        data: &cpi_aux_data,
+        data: bytemuck::bytes_of(&updated_aux),
     }
     .invoke_signed(&[cpi_signer])
 }
