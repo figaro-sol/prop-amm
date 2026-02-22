@@ -5,13 +5,13 @@ use pinocchio::{
 };
 
 use c_u_soon::{Envelope, TypeHash};
-use c_u_soon_cpi::{next_sequence, UpdateAuxiliaryDelegated};
+use c_u_soon_cpi::{next_sequence, UpdateAuxiliaryDelegatedMultiRange};
 
 use crate::{
     error::PropAmmError,
     math::{buy_base_piecewise, sell_base_piecewise},
     pda::POOL_SEED,
-    state::{PropAmmAux, PropAmmAuxProgram, PropAmmQuote},
+    state::{PropAmmAux, PropAmmAuxProgram, PropAmmAuxProgramDelta, PropAmmQuote},
     token::{get_mint_decimals, get_token_account_balance, transfer_tokens},
 };
 
@@ -158,7 +158,10 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
         return Err(PropAmmError::InvalidPda.into());
     }
 
-    // Copy mutable state
+    // Snapshot immutable fields for PDA signing and mutable state for swap math
+    let base_mint_bytes = aux.base_mint;
+    let quote_mint_bytes = aux.quote_mint;
+    let pool_authority_bump = aux.pool_authority_bump;
     let mut updated_aux: PropAmmAux = *aux;
     let oracle_sequence = envelope.oracle_state.sequence;
     let program_aux_sequence = envelope.program_aux_sequence;
@@ -235,12 +238,20 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     // Drop envelope borrow before CPI
     drop(envelope_data);
 
+    // Build delta with only the changed #[program] fields
+    let mut delta = PropAmmAuxProgramDelta::new();
+    delta
+        .set_bid_accumulated(updated_aux.bid_accumulated)
+        .set_ask_accumulated(updated_aux.ask_accumulated)
+        .set_accumulated_at_seq(updated_aux.accumulated_at_seq);
+    let write_specs = delta.to_write_specs();
+
     // Token transfers
-    let bump_seed = [updated_aux.pool_authority_bump];
+    let bump_seed = [pool_authority_bump];
     let pool_signer_seeds = [
         Seed::from(POOL_SEED),
-        Seed::from(&updated_aux.base_mint),
-        Seed::from(&updated_aux.quote_mint),
+        Seed::from(&base_mint_bytes),
+        Seed::from(&quote_mint_bytes),
         Seed::from(&bump_seed),
     ];
     let signer = Signer::from(&pool_signer_seeds);
@@ -296,25 +307,25 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
         }
     }
 
-    // CPI to c_u_soon: UpdateAuxiliaryDelegated
+    // CPI to c_u_soon: UpdateAuxiliaryDelegatedMultiRange
     let cpi_sequence = next_sequence(program_aux_sequence)?;
 
     let pool_signer_seeds2 = [
         Seed::from(POOL_SEED),
-        Seed::from(&updated_aux.base_mint),
-        Seed::from(&updated_aux.quote_mint),
+        Seed::from(&base_mint_bytes),
+        Seed::from(&quote_mint_bytes),
         Seed::from(&bump_seed),
     ];
     let cpi_signer = Signer::from(&pool_signer_seeds2);
 
-    UpdateAuxiliaryDelegated {
+    UpdateAuxiliaryDelegatedMultiRange {
         envelope: envelope_account,
         delegation_auth: pool_authority_pda,
         padding: user,
         program: c_u_soon_program,
         metadata: PropAmmAux::METADATA.as_u64(),
         sequence: cpi_sequence,
-        data: bytemuck::bytes_of(&updated_aux),
+        ranges: &write_specs,
     }
     .invoke_signed(&[cpi_signer])
 }
