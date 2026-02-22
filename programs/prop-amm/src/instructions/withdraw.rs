@@ -4,14 +4,13 @@ use pinocchio::{
     AccountView, Address, ProgramResult,
 };
 
-use c_u_soon::{Envelope, TypeHash};
-use c_u_soon_cpi::{next_sequence, UpdateAuxiliary};
+use c_u_soon::Envelope;
 
 use crate::{
     error::PropAmmError,
     pda::POOL_SEED,
-    state::{PropAmmAux, PropAmmAuxAuthority},
-    token::{get_mint_decimals, transfer_tokens},
+    state::PropAmmAux,
+    token::{get_mint_decimals, get_token_account_balance, transfer_tokens},
 };
 
 use super::TokenSide;
@@ -41,7 +40,7 @@ impl WithdrawData {
 ///
 /// Accounts:
 ///  0. [signer]    authority              — envelope authority
-///  1. [writable]  envelope               — c_u_soon envelope
+///  1. []          envelope               — c_u_soon envelope (readonly)
 ///  2. [writable]  authority_token_account — destination
 ///  3. [writable]  vault                  — pool's token vault (source)
 ///  4. []          mint
@@ -71,10 +70,7 @@ pub fn process_withdraw(
     if !authority.is_signer() {
         return Err(PropAmmError::NotSigner.into());
     }
-    if !envelope_account.is_writable()
-        || !authority_token_account.is_writable()
-        || !vault.is_writable()
-    {
+    if !authority_token_account.is_writable() || !vault.is_writable() {
         return Err(PropAmmError::NotWritable.into());
     }
     if ix_data.amount == 0 {
@@ -108,7 +104,7 @@ pub fn process_withdraw(
         return Err(PropAmmError::InvalidPda.into());
     }
 
-    // Validate mint, vault, and withdrawable amount
+    // Validate mint and vault identity
     match ix_data.side {
         TokenSide::Base => {
             if mint.address().as_ref() != &aux.base_mint {
@@ -116,16 +112,6 @@ pub fn process_withdraw(
             }
             if vault.address().as_ref() != &aux.base_vault {
                 return Err(PropAmmError::InvalidTokenAccount.into());
-            }
-            let effective = aux
-                .ask_total_size
-                .checked_add(aux.ask_credit)
-                .ok_or(PropAmmError::MathOverflow)?;
-            let withdrawable = effective
-                .checked_sub(aux.ask_accumulated)
-                .ok_or(PropAmmError::MathOverflow)?;
-            if withdrawable < ix_data.amount {
-                return Err(PropAmmError::InsufficientFunds.into());
             }
         }
         TokenSide::Quote => {
@@ -135,54 +121,29 @@ pub fn process_withdraw(
             if vault.address().as_ref() != &aux.quote_vault {
                 return Err(PropAmmError::InvalidTokenAccount.into());
             }
-            let effective = aux
-                .bid_total_size
-                .checked_add(aux.bid_credit)
-                .ok_or(PropAmmError::MathOverflow)?;
-            let withdrawable = effective
-                .checked_sub(aux.bid_accumulated)
-                .ok_or(PropAmmError::MathOverflow)?;
-            if withdrawable < ix_data.amount {
-                return Err(PropAmmError::InsufficientFunds.into());
-            }
         }
     }
 
-    // Copy mutable state and read sequence before dropping borrow
-    let mut updated_aux: PropAmmAux = *aux;
-    let authority_aux_sequence = envelope.authority_aux_sequence;
+    let pool_authority_bump = aux.pool_authority_bump;
+    let base_mint = aux.base_mint;
+    let quote_mint = aux.quote_mint;
 
-    // Get decimals
     let decimals = get_mint_decimals(mint)?;
 
-    // Drop borrow before CPI
     drop(envelope_data);
 
-    // Update total_size through typed wrapper (authority-only field access)
-    {
-        let mut aux_w = PropAmmAuxAuthority::from_mut(&mut updated_aux);
-        match ix_data.side {
-            TokenSide::Base => {
-                *aux_w.ask_total_size_mut() = aux_w
-                    .ask_total_size
-                    .checked_sub(ix_data.amount)
-                    .ok_or(PropAmmError::MathOverflow)?;
-            }
-            TokenSide::Quote => {
-                *aux_w.bid_total_size_mut() = aux_w
-                    .bid_total_size
-                    .checked_sub(ix_data.amount)
-                    .ok_or(PropAmmError::MathOverflow)?;
-            }
-        }
+    // Vault balance is ground truth: withdraw only what is actually there
+    let vault_balance = get_token_account_balance(vault)?;
+    if vault_balance < ix_data.amount {
+        return Err(PropAmmError::InsufficientFunds.into());
     }
 
     // Token transfer: vault → authority (pool_authority_pda signs)
-    let bump_seed = [updated_aux.pool_authority_bump];
+    let bump_seed = [pool_authority_bump];
     let pool_signer_seeds = [
         Seed::from(POOL_SEED),
-        Seed::from(&updated_aux.base_mint),
-        Seed::from(&updated_aux.quote_mint),
+        Seed::from(&base_mint),
+        Seed::from(&quote_mint),
         Seed::from(&bump_seed),
     ];
     let signer = Signer::from(&pool_signer_seeds);
@@ -196,27 +157,5 @@ pub fn process_withdraw(
         ix_data.amount,
         decimals,
         &[signer],
-    )?;
-
-    // CPI to c_u_soon: UpdateAuxiliary (authority path)
-    let cpi_sequence = next_sequence(authority_aux_sequence)?;
-
-    let pool_signer_seeds2 = [
-        Seed::from(POOL_SEED),
-        Seed::from(&updated_aux.base_mint),
-        Seed::from(&updated_aux.quote_mint),
-        Seed::from(&bump_seed),
-    ];
-    let cpi_signer = Signer::from(&pool_signer_seeds2);
-
-    UpdateAuxiliary {
-        authority,
-        envelope: envelope_account,
-        pda: pool_authority_pda,
-        program: c_u_soon_program,
-        metadata: PropAmmAux::METADATA.as_u64(),
-        sequence: cpi_sequence,
-        data: bytemuck::bytes_of(&updated_aux),
-    }
-    .invoke_signed(&[cpi_signer])
+    )
 }

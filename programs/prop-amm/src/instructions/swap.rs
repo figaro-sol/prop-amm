@@ -12,7 +12,7 @@ use crate::{
     math::{buy_base_piecewise, sell_base_piecewise},
     pda::POOL_SEED,
     state::{PropAmmAux, PropAmmAuxProgram, PropAmmQuote},
-    token::{get_mint_decimals, transfer_tokens},
+    token::{get_mint_decimals, get_token_account_balance, transfer_tokens},
 };
 
 /// Swap direction
@@ -163,29 +163,29 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     let oracle_sequence = envelope.oracle_state.sequence;
     let program_aux_sequence = envelope.program_aux_sequence;
 
-    // Get decimals before dropping borrow
+    // Get decimals and vault balances before dropping borrow
     let base_decimals = get_mint_decimals(base_mint)?;
     let quote_decimals = get_mint_decimals(quote_mint)?;
+    let base_vault_balance = get_token_account_balance(base_vault)?;
+    let quote_vault_balance = get_token_account_balance(quote_vault)?;
 
     // Execute swap through typed wrapper (program-only field access)
     let (transfer_in_amount, transfer_out_amount) = {
         let mut aux_w = PropAmmAuxProgram::from_mut(&mut updated_aux);
 
-        // Oracle freshness: reset credit/accumulated on new oracle sequence
+        // Oracle freshness: reset accumulated on new oracle sequence.
         if oracle_sequence > aux_w.accumulated_at_seq {
-            *aux_w.bid_credit_mut() = 0;
             *aux_w.bid_accumulated_mut() = 0;
-            *aux_w.ask_credit_mut() = 0;
             *aux_w.ask_accumulated_mut() = 0;
             *aux_w.accumulated_at_seq_mut() = oracle_sequence;
         }
 
         match ix_data.direction {
             SwapDirection::BuyBaseWithQuote => {
-                // User spends quote to buy base (consumes ask side)
-                let effective_total = aux_w
-                    .ask_total_size
-                    .checked_add(aux_w.ask_credit)
+                // User spends quote to buy base (consumes ask side).
+                // Vault balance is ground truth: effective = base_vault + ask_accumulated.
+                let effective_total = base_vault_balance
+                    .checked_add(aux_w.ask_accumulated)
                     .ok_or(PropAmmError::MathOverflow)?;
 
                 let (base_bought, quote_used, new_consumed) = buy_base_piecewise(
@@ -201,26 +201,15 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
                 }
 
                 *aux_w.ask_accumulated_mut() = new_consumed;
-                if quote_used > 0 {
-                    if aux_w.bid_accumulated >= quote_used {
-                        *aux_w.bid_accumulated_mut() -= quote_used;
-                    } else {
-                        let remainder = quote_used - aux_w.bid_accumulated;
-                        *aux_w.bid_accumulated_mut() = 0;
-                        *aux_w.bid_credit_mut() = aux_w
-                            .bid_credit
-                            .checked_add(remainder)
-                            .ok_or(PropAmmError::MathOverflow)?;
-                    }
-                }
+                *aux_w.bid_accumulated_mut() = aux_w.bid_accumulated.saturating_sub(quote_used);
 
                 (quote_used, base_bought)
             }
             SwapDirection::SellBaseForQuote => {
-                // User sells base for quote (consumes bid side)
-                let effective_total = aux_w
-                    .bid_total_size
-                    .checked_add(aux_w.bid_credit)
+                // User sells base for quote (consumes bid side).
+                // Vault balance is ground truth: effective = quote_vault + bid_accumulated.
+                let effective_total = quote_vault_balance
+                    .checked_add(aux_w.bid_accumulated)
                     .ok_or(PropAmmError::MathOverflow)?;
 
                 let (quote_received, base_used, new_consumed) = sell_base_piecewise(
@@ -236,18 +225,7 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
                 }
 
                 *aux_w.bid_accumulated_mut() = new_consumed;
-                if base_used > 0 {
-                    if aux_w.ask_accumulated >= base_used {
-                        *aux_w.ask_accumulated_mut() -= base_used;
-                    } else {
-                        let remainder = base_used - aux_w.ask_accumulated;
-                        *aux_w.ask_accumulated_mut() = 0;
-                        *aux_w.ask_credit_mut() = aux_w
-                            .ask_credit
-                            .checked_add(remainder)
-                            .ok_or(PropAmmError::MathOverflow)?;
-                    }
-                }
+                *aux_w.ask_accumulated_mut() = aux_w.ask_accumulated.saturating_sub(base_used);
 
                 (base_used, quote_received)
             }

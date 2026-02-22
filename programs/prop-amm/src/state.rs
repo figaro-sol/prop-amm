@@ -16,7 +16,7 @@ pub struct PropAmmQuote {
 }
 
 /// Auxiliary envelope data: all mutable pool state.
-/// 200 bytes (193 essential + 7 alignment padding).
+/// 168 bytes.
 #[derive(TypeHash, CuLater, Pod, Zeroable, Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct PropAmmAux {
@@ -28,33 +28,25 @@ pub struct PropAmmAux {
 
     // #[authority]: liquidity management
     #[authority]
-    pub bid_total_size: u64, // 128..136
+    pub is_active: u8, // 128
     #[authority]
-    pub ask_total_size: u64, // 136..144
-    #[authority]
-    pub is_active: u8, // 144
-    #[authority]
-    pub _pad_active: [u8; 7], // 145..152
+    pub _pad_active: [u8; 7], // 129..136
 
     // #[program]: swap-mutated state
     #[program]
-    pub bid_credit: u64, // 152..160
+    pub bid_accumulated: u64, // 136..144
     #[program]
-    pub bid_accumulated: u64, // 160..168
+    pub ask_accumulated: u64, // 144..152
     #[program]
-    pub ask_credit: u64, // 168..176
-    #[program]
-    pub ask_accumulated: u64, // 176..184
-    #[program]
-    pub accumulated_at_seq: u64, // 184..192
+    pub accumulated_at_seq: u64, // 152..160
 
     // No mark: immutable after ForceUpdate
-    pub pool_authority_bump: u8, // 192
-    pub _pad_bump: [u8; 7],      // 193..200
+    pub pool_authority_bump: u8, // 160
+    pub _pad_bump: [u8; 7],      // 161..168
 }
 
 const _: () = assert!(core::mem::size_of::<PropAmmQuote>() == 112);
-const _: () = assert!(core::mem::size_of::<PropAmmAux>() == 200);
+const _: () = assert!(core::mem::size_of::<PropAmmAux>() == 168);
 const _: () = assert!(core::mem::size_of::<PropAmmQuote>() <= 239);
 
 /// Local computation struct for swap math.
@@ -90,16 +82,15 @@ mod tests {
 
     #[test]
     fn test_aux_size() {
-        assert_eq!(core::mem::size_of::<PropAmmAux>(), 200);
+        assert_eq!(core::mem::size_of::<PropAmmAux>(), 168);
     }
 
     #[test]
     fn test_program_mask() {
         let mask = to_program_wire_mask::<PropAmmAux>();
-        // bid_credit (152..160), bid_accumulated (160..168),
-        // ask_credit (168..176), ask_accumulated (176..184),
-        // accumulated_at_seq (184..192) should be writable (0x00)
-        for i in 152..192 {
+        // bid_accumulated (136..144), ask_accumulated (144..152),
+        // accumulated_at_seq (152..160) should be writable
+        for i in 136..160 {
             assert!(mask.is_writable(i), "byte {} should be program-writable", i);
         }
         // Immutable fields should be blocked
@@ -111,7 +102,7 @@ mod tests {
             );
         }
         // Authority fields should be blocked for program
-        for i in 128..152 {
+        for i in 128..136 {
             assert!(
                 !mask.is_writable(i),
                 "byte {} should be blocked for program",
@@ -119,7 +110,7 @@ mod tests {
             );
         }
         // pool_authority_bump + padding should be blocked
-        for i in 192..200 {
+        for i in 160..168 {
             assert!(
                 !mask.is_writable(i),
                 "byte {} should be blocked for program",
@@ -131,9 +122,8 @@ mod tests {
     #[test]
     fn test_authority_mask() {
         let mask = to_authority_wire_mask::<PropAmmAux>();
-        // bid_total_size (128..136), ask_total_size (136..144),
-        // is_active (144), _pad_active (145..152) should be writable
-        for i in 128..152 {
+        // is_active (128), _pad_active (129..136) should be writable
+        for i in 128..136 {
             assert!(
                 mask.is_writable(i),
                 "byte {} should be authority-writable",
@@ -149,7 +139,7 @@ mod tests {
             );
         }
         // Program fields should be blocked for authority
-        for i in 152..192 {
+        for i in 136..160 {
             assert!(
                 !mask.is_writable(i),
                 "byte {} should be blocked for authority",

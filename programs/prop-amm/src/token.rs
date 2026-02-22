@@ -97,3 +97,19 @@ pub fn get_mint_decimals(mint: &AccountView) -> Result<u8, PropAmmError> {
     }
     Ok(data[44])
 }
+
+/// Get balance from an SPL token account.
+///
+/// Token account layout:
+/// - 0-32:  mint (Pubkey)
+/// - 32-64: owner (Pubkey)
+/// - 64-72: amount (u64 LE)
+pub fn get_token_account_balance(account: &AccountView) -> Result<u64, PropAmmError> {
+    let data = account
+        .try_borrow()
+        .map_err(|_| PropAmmError::InvalidTokenAccount)?;
+    if data.len() < 72 {
+        return Err(PropAmmError::InvalidTokenAccount);
+    }
+    Ok(u64::from_le_bytes(data[64..72].try_into().unwrap()))
+}

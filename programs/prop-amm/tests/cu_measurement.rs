@@ -1,4 +1,4 @@
-//! CU measurement and credit model verification tests.
+//! CU measurement and swap model verification tests.
 //!
 //! Requires compiled binaries:
 //! - `cargo build-sbf` in prop-amm (produces prop_amm.so)
@@ -18,6 +18,7 @@ use prop_amm::{
 use solana_sdk::{
     account::Account,
     instruction::{AccountMeta, Instruction},
+    program_error::ProgramError as SolanaProgramError,
 };
 
 const PROP_AMM_ID: Address = Address::new_from_array([
@@ -39,7 +40,7 @@ const PROP_AMM_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/d
 
 const C_U_SOON_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../target/deploy/c_u_soon_program"
+    "/../../c_u_soon/target/deploy/c_u_soon_program"
 );
 
 const PRICE_SCALE: u64 = 1_000_000_000;
@@ -64,8 +65,8 @@ const ASK_PRICES: [u64; 7] = [
     207 * PRICE_SCALE,
 ];
 
-const BID_TOTAL_SIZE: u64 = 2_000_000_000; // 2000 USDC (6 decimals)
-const ASK_TOTAL_SIZE: u64 = 10_000_000_000; // 10 SOL (9 decimals)
+// Vault starting balance used in build_accounts
+const VAULT_INITIAL_BALANCE: u64 = 100_000_000_000;
 
 // -- Helper functions --
 
@@ -182,6 +183,14 @@ fn create_fast_path_update_data(sequence: u64, quote: &PropAmmQuote) -> Vec<u8> 
     data
 }
 
+fn create_withdraw_data(side: u8, amount: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(10);
+    data.push(1u8); // Withdraw discriminator
+    data.push(side); // 0 = Base, 1 = Quote
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
 fn default_quote() -> PropAmmQuote {
     PropAmmQuote {
         bid_prices: BID_PRICES,
@@ -201,13 +210,9 @@ fn default_aux(
         quote_mint: [0u8; 32],
         base_vault: [0u8; 32],
         quote_vault: [0u8; 32],
-        bid_total_size: BID_TOTAL_SIZE,
-        ask_total_size: ASK_TOTAL_SIZE,
         is_active: 1,
         _pad_active: [0u8; 7],
-        bid_credit: 0,
         bid_accumulated: 0,
-        ask_credit: 0,
         ask_accumulated: 0,
         accumulated_at_seq: 1, // matches oracle sequence
         pool_authority_bump: pool_bump,
@@ -233,6 +238,8 @@ struct SwapSetup {
     pool_bump: u8,
     padding_key: Address,
     authority: Address,
+    authority_base_key: Address,
+    authority_quote_key: Address,
 }
 
 impl SwapSetup {
@@ -259,6 +266,8 @@ impl SwapSetup {
             pool_bump,
             padding_key: Address::new_unique(),
             authority,
+            authority_base_key: Address::new_unique(),
+            authority_quote_key: Address::new_unique(),
         }
     }
 
@@ -280,11 +289,11 @@ impl SwapSetup {
             ),
             (
                 self.base_vault_key,
-                create_token_account(&self.base_mint_key, &self.pool_pda, 100_000_000_000),
+                create_token_account(&self.base_mint_key, &self.pool_pda, VAULT_INITIAL_BALANCE),
             ),
             (
                 self.quote_vault_key,
-                create_token_account(&self.quote_mint_key, &self.pool_pda, 100_000_000_000),
+                create_token_account(&self.quote_mint_key, &self.pool_pda, VAULT_INITIAL_BALANCE),
             ),
             (self.base_mint_key, create_mint_account(9)), // SOL-like (9 decimals)
             (self.quote_mint_key, create_mint_account(6)), // USDC-like (6 decimals)
@@ -295,6 +304,14 @@ impl SwapSetup {
             (C_U_SOON_ID, create_program_account_loader_v3(&C_U_SOON_ID)),
             (self.pool_pda, create_funded_account(0)),
             (self.padding_key, create_funded_account(0)),
+            (
+                self.authority_base_key,
+                create_token_account(&self.base_mint_key, &self.authority, 0),
+            ),
+            (
+                self.authority_quote_key,
+                create_token_account(&self.quote_mint_key, &self.authority, 0),
+            ),
         ]
     }
 
@@ -320,13 +337,47 @@ impl SwapSetup {
         )
     }
 
-    fn build_oracle_fast_update_instruction(&self, sequence: u64, quote: &PropAmmQuote) -> Instruction {
+    fn build_oracle_fast_update_instruction(
+        &self,
+        sequence: u64,
+        quote: &PropAmmQuote,
+    ) -> Instruction {
         Instruction::new_with_bytes(
             C_U_SOON_ID,
             &create_fast_path_update_data(sequence, quote),
             vec![
                 AccountMeta::new_readonly(self.authority, true),
                 AccountMeta::new(self.envelope_key, false),
+            ],
+        )
+    }
+
+    fn build_withdraw_instruction(&self, side: u8, amount: u64) -> Instruction {
+        let (vault_key, mint_key, authority_token_key) = if side == 0 {
+            (
+                self.base_vault_key,
+                self.base_mint_key,
+                self.authority_base_key,
+            )
+        } else {
+            (
+                self.quote_vault_key,
+                self.quote_mint_key,
+                self.authority_quote_key,
+            )
+        };
+        Instruction::new_with_bytes(
+            PROP_AMM_ID,
+            &create_withdraw_data(side, amount),
+            vec![
+                AccountMeta::new_readonly(self.authority, true), // 0: authority (signer)
+                AccountMeta::new_readonly(self.envelope_key, false), // 1: envelope (readonly)
+                AccountMeta::new(authority_token_key, false),    // 2: authority_token_account
+                AccountMeta::new(vault_key, false),              // 3: vault
+                AccountMeta::new_readonly(mint_key, false),      // 4: mint
+                AccountMeta::new_readonly(SPL_TOKEN_ID, false),  // 5: token_program
+                AccountMeta::new_readonly(C_U_SOON_ID, false),   // 6: c_u_soon_program
+                AccountMeta::new_readonly(self.pool_pda, false), // 7: pool_authority_pda
             ],
         )
     }
@@ -367,7 +418,9 @@ fn read_quote_from_result(
         .expect("envelope not found in resulting accounts");
 
     let envelope: &Envelope = from_bytes(&envelope_account.data[..Envelope::SIZE]);
-    *envelope.oracle::<PropAmmQuote>().expect("quote decode failed")
+    *envelope
+        .oracle::<PropAmmQuote>()
+        .expect("quote decode failed")
 }
 
 fn read_oracle_sequence_from_result(
@@ -452,17 +505,17 @@ fn test_swap_sell_cu() {
 }
 
 #[test]
-fn test_swap_credit_model() {
+fn test_buy_then_sell_math_replay() {
+    // Verifies accumulated state and vault balances after buy→sell sequence.
+    // effective_total = vault_balance + accumulated (vault is ground truth).
     let mollusk = setup_mollusk();
     let setup = SwapSetup::new();
     let aux = setup.default_aux();
     let accounts = setup.build_accounts(&aux);
 
-    // Step 1: Buy swap (consume ask, credit bid via heal-then-grow)
     let quote_in: u64 = 100_000_000; // 100 USDC
     let buy_ix = setup.build_swap_instruction(0, quote_in, 0);
 
-    // Step 2: Sell swap (consume bid, credit ask via heal-then-grow)
     let base_in: u64 = 500_000_000; // 0.5 SOL
     let sell_ix = setup.build_swap_instruction(1, base_in, 0);
 
@@ -474,79 +527,65 @@ fn test_swap_credit_model() {
         &accounts,
     );
 
-    // Read final aux state from envelope
     let final_aux = read_aux_from_result(&result, &setup.envelope_key);
+    let base_vault_balance = read_token_amount_from_result(&result, &setup.base_vault_key);
+    let quote_vault_balance = read_token_amount_from_result(&result, &setup.quote_vault_key);
 
-    // Compute expected state by replaying the math locally
+    // Replay math locally to compute expected state.
+    // Buy: effective = base_vault + ask_accumulated = 100B + 0 = 100B
+    let ask_effective_initial = VAULT_INITIAL_BALANCE; // vault + 0
+    let (base_bought, quote_used, ask_acc_after_buy) =
+        buy_base_piecewise(quote_in, &ASK_PRICES, ask_effective_initial, 0).unwrap();
+    assert!(base_bought > 0);
 
-    // After buy: consumes ask side, credits bid side
-    let ask_effective = ASK_TOTAL_SIZE; // no credit yet
-    let (base_bought, quote_used, new_ask_consumed) =
-        buy_base_piecewise(quote_in, &ASK_PRICES, ask_effective, 0).unwrap();
-    assert!(base_bought > 0, "buy should produce base");
+    let base_vault_after_buy = VAULT_INITIAL_BALANCE - base_bought;
+    let quote_vault_after_buy = VAULT_INITIAL_BALANCE + quote_used;
+    // bid_accumulated = 0.saturating_sub(quote_used) = 0
+    let bid_acc_after_buy: u64 = 0;
 
-    // Heal-then-grow on bid side: bid_accumulated=0, so all quote_used goes to bid_credit
-    let expected_bid_credit_after_buy = quote_used;
-    let expected_bid_accumulated_after_buy: u64 = 0;
-    let expected_ask_accumulated_after_buy = new_ask_consumed;
-    let expected_ask_credit_after_buy: u64 = 0;
-
-    // After sell: consumes bid side (now with credit), credits ask side
-    let bid_effective = BID_TOTAL_SIZE + expected_bid_credit_after_buy;
-    let (quote_received, base_used, new_bid_consumed) = sell_base_piecewise(
+    // Sell: effective = quote_vault + bid_accumulated
+    let bid_effective_after_buy = quote_vault_after_buy + bid_acc_after_buy;
+    let (quote_received, base_used, bid_acc_final) = sell_base_piecewise(
         base_in,
         &BID_PRICES,
-        bid_effective,
-        expected_bid_accumulated_after_buy,
+        bid_effective_after_buy,
+        bid_acc_after_buy,
     )
     .unwrap();
-    assert!(quote_received > 0, "sell should produce quote");
+    assert!(quote_received > 0);
 
-    let expected_bid_accumulated_final = new_bid_consumed;
+    let expected_base_vault = base_vault_after_buy + base_used;
+    let expected_quote_vault = quote_vault_after_buy - quote_received;
+    let expected_ask_accumulated = ask_acc_after_buy.saturating_sub(base_used);
 
-    // Heal-then-grow on ask side: ask_accumulated=new_ask_consumed from buy
-    let expected_ask_credit_final;
-    let expected_ask_accumulated_final;
-    if expected_ask_accumulated_after_buy >= base_used {
-        expected_ask_accumulated_final = expected_ask_accumulated_after_buy - base_used;
-        expected_ask_credit_final = expected_ask_credit_after_buy;
-    } else {
-        let remainder = base_used - expected_ask_accumulated_after_buy;
-        expected_ask_accumulated_final = 0;
-        expected_ask_credit_final = expected_ask_credit_after_buy + remainder;
-    }
-
-    // Verify
     assert_eq!(
-        final_aux.bid_credit, expected_bid_credit_after_buy,
-        "bid_credit mismatch: got {}, expected {}",
-        final_aux.bid_credit, expected_bid_credit_after_buy
-    );
-    assert_eq!(
-        final_aux.bid_accumulated, expected_bid_accumulated_final,
-        "bid_accumulated mismatch: got {}, expected {}",
-        final_aux.bid_accumulated, expected_bid_accumulated_final
-    );
-    assert_eq!(
-        final_aux.ask_credit, expected_ask_credit_final,
-        "ask_credit mismatch: got {}, expected {}",
-        final_aux.ask_credit, expected_ask_credit_final
-    );
-    assert_eq!(
-        final_aux.ask_accumulated, expected_ask_accumulated_final,
+        final_aux.ask_accumulated, expected_ask_accumulated,
         "ask_accumulated mismatch: got {}, expected {}",
-        final_aux.ask_accumulated, expected_ask_accumulated_final
+        final_aux.ask_accumulated, expected_ask_accumulated
+    );
+    assert_eq!(
+        final_aux.bid_accumulated, bid_acc_final,
+        "bid_accumulated mismatch: got {}, expected {}",
+        final_aux.bid_accumulated, bid_acc_final
+    );
+    assert_eq!(
+        base_vault_balance, expected_base_vault,
+        "base vault balance mismatch"
+    );
+    assert_eq!(
+        quote_vault_balance, expected_quote_vault,
+        "quote vault balance mismatch"
     );
 
     println!("========================================");
-    println!("Credit model verification passed:");
+    println!("Vault-balance model verification passed:");
     println!(
-        "  After buy: ask_acc={}, bid_credit={}",
-        expected_ask_accumulated_after_buy, expected_bid_credit_after_buy
+        "  After buy: base_vault={} ask_acc={}",
+        base_vault_after_buy, ask_acc_after_buy
     );
     println!(
-        "  After sell: bid_acc={}, ask_credit={}, ask_acc={}",
-        expected_bid_accumulated_final, expected_ask_credit_final, expected_ask_accumulated_final
+        "  After sell: bid_acc={} ask_acc={}",
+        bid_acc_final, expected_ask_accumulated
     );
     println!("  base_bought={}, quote_used={}", base_bought, quote_used);
     println!(
@@ -593,14 +632,27 @@ fn test_oracle_fast_path_update_then_swap_uses_new_prices() {
     let final_oracle_sequence = read_oracle_sequence_from_result(&result, &setup.envelope_key);
     let user_base_amount = read_token_amount_from_result(&result, &setup.user_base_key);
 
-    let (expected_base_out_new, quote_used, expected_ask_acc) =
-        buy_base_piecewise(quote_in, &updated_quote.ask_prices, ASK_TOTAL_SIZE, 0)
-            .expect("new quote math should succeed");
-    let (expected_base_out_old, _, _) = buy_base_piecewise(quote_in, &ASK_PRICES, ASK_TOTAL_SIZE, 0)
-        .expect("old quote math should succeed");
+    // After oracle reset (seq 1→2), accumulated zeroed. effective = vault + 0 = 100B.
+    let effective_after_reset = VAULT_INITIAL_BALANCE;
+    let (expected_base_out_new, _quote_used, expected_ask_acc) = buy_base_piecewise(
+        quote_in,
+        &updated_quote.ask_prices,
+        effective_after_reset,
+        0,
+    )
+    .expect("new quote math should succeed");
+    let (expected_base_out_old, _, _) =
+        buy_base_piecewise(quote_in, &ASK_PRICES, effective_after_reset, 0)
+            .expect("old quote math should succeed");
 
-    assert_eq!(final_quote, updated_quote, "oracle quote should be fast-path updated");
-    assert_eq!(final_oracle_sequence, 2, "oracle sequence should advance via c_u_soon");
+    assert_eq!(
+        final_quote, updated_quote,
+        "oracle quote should be fast-path updated"
+    );
+    assert_eq!(
+        final_oracle_sequence, 2,
+        "oracle sequence should advance via c_u_soon"
+    );
     assert_eq!(
         user_base_amount,
         100_000_000_000 + expected_base_out_new,
@@ -610,11 +662,444 @@ fn test_oracle_fast_path_update_then_swap_uses_new_prices() {
         expected_base_out_new < expected_base_out_old,
         "higher ask prices should reduce base output",
     );
-
     assert_eq!(
         final_aux.accumulated_at_seq, 2,
         "swap should track latest oracle sequence",
     );
     assert_eq!(final_aux.ask_accumulated, expected_ask_acc);
-    assert_eq!(final_aux.bid_credit, quote_used);
+    // bid_accumulated: reset to 0, then saturating_sub(quote_used) = 0
+    assert_eq!(final_aux.bid_accumulated, 0);
+}
+
+// -- Withdraw tests --
+
+#[test]
+fn test_withdraw_base_happy_path() {
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let aux = setup.default_aux();
+    let accounts = setup.build_accounts(&aux);
+
+    let withdraw_amount: u64 = 5_000_000_000; // 5 SOL
+    let ix = setup.build_withdraw_instruction(0, withdraw_amount);
+
+    let result = mollusk.process_and_validate_instruction(&ix, &accounts, &[Check::success()]);
+
+    let vault_balance = read_token_amount_from_result(&result, &setup.base_vault_key);
+    assert_eq!(vault_balance, VAULT_INITIAL_BALANCE - withdraw_amount);
+    let authority_balance = read_token_amount_from_result(&result, &setup.authority_base_key);
+    assert_eq!(authority_balance, withdraw_amount);
+}
+
+#[test]
+fn test_withdraw_quote_happy_path() {
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let aux = setup.default_aux();
+    let accounts = setup.build_accounts(&aux);
+
+    let withdraw_amount: u64 = 1_000_000_000;
+    let ix = setup.build_withdraw_instruction(1, withdraw_amount);
+
+    let result = mollusk.process_and_validate_instruction(&ix, &accounts, &[Check::success()]);
+
+    let vault_balance = read_token_amount_from_result(&result, &setup.quote_vault_key);
+    assert_eq!(vault_balance, VAULT_INITIAL_BALANCE - withdraw_amount);
+    let authority_balance = read_token_amount_from_result(&result, &setup.authority_quote_key);
+    assert_eq!(authority_balance, withdraw_amount);
+}
+
+#[test]
+fn test_withdraw_respects_vault_balance() {
+    // Withdrawal is bounded by vault_balance (VAULT_INITIAL_BALANCE in default setup).
+    // accumulated does not constrain withdrawal; only what is physically in the vault.
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+
+    let mut aux = setup.default_aux();
+    aux.ask_accumulated = 7_000_000_000; // pre-set accumulated (does NOT limit withdrawal)
+    let accounts = setup.build_accounts(&aux);
+
+    // Over the vault balance → InsufficientFunds
+    let ix_over = setup.build_withdraw_instruction(0, VAULT_INITIAL_BALANCE + 1);
+    mollusk.process_and_validate_instruction(
+        &ix_over,
+        &accounts,
+        &[Check::err(SolanaProgramError::Custom(18))],
+    );
+
+    // Exactly vault balance → success
+    let ix_ok = setup.build_withdraw_instruction(0, VAULT_INITIAL_BALANCE);
+    let result = mollusk.process_and_validate_instruction(&ix_ok, &accounts, &[Check::success()]);
+
+    let vault_balance = read_token_amount_from_result(&result, &setup.base_vault_key);
+    assert_eq!(vault_balance, 0, "vault should be fully drained");
+    assert_eq!(
+        read_token_amount_from_result(&result, &setup.authority_base_key),
+        VAULT_INITIAL_BALANCE,
+    );
+}
+
+#[test]
+fn test_withdraw_fails_zero_amount() {
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let aux = setup.default_aux();
+    let accounts = setup.build_accounts(&aux);
+
+    let ix = setup.build_withdraw_instruction(0, 0);
+    mollusk.process_and_validate_instruction(
+        &ix,
+        &accounts,
+        &[Check::err(SolanaProgramError::Custom(12))], // ZeroAmount
+    );
+}
+
+#[test]
+fn test_oracle_reset_zeros_accumulated() {
+    // After oracle sequence advances, accumulated resets to 0 on next swap.
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+
+    // Pre-set accumulated state. accumulated_at_seq=1 matches oracle sequence=1.
+    let mut aux = setup.default_aux();
+    aux.ask_accumulated = 500_000_000;
+    aux.bid_accumulated = 300_000_000;
+    let accounts = setup.build_accounts(&aux);
+
+    // Advance oracle sequence to 2 (fast path — does not touch aux)
+    let update_ix = setup.build_oracle_fast_update_instruction(2, &default_quote());
+    // Any swap now sees oracle_sequence=2 > accumulated_at_seq=1 → reset path
+    let swap_ix = setup.build_swap_instruction(0, 100_000_000, 0);
+
+    let result = mollusk.process_and_validate_instruction_chain(
+        &[
+            (&update_ix, &[Check::success()]),
+            (&swap_ix, &[Check::success()]),
+        ],
+        &accounts,
+    );
+
+    let final_aux = read_aux_from_result(&result, &setup.envelope_key);
+
+    assert_eq!(
+        final_aux.accumulated_at_seq, 2,
+        "accumulated_at_seq should update to new oracle sequence",
+    );
+    // bid_accumulated: reset to 0, then saturating_sub(quote_used) = 0
+    assert_eq!(
+        final_aux.bid_accumulated, 0,
+        "bid_accumulated should be 0 after reset and buy swap",
+    );
+
+    // Exact output check: swap must use reset effective_total (vault_balance, not vault+old_acc).
+    // Post-reset: effective = vault_balance = 100B, consumed = 0
+    let (expected_base_out, _, expected_ask_acc) = buy_base_piecewise(
+        100_000_000,
+        &default_quote().ask_prices,
+        VAULT_INITIAL_BALANCE,
+        0,
+    )
+    .unwrap();
+    // Pre-reset (wrong path): effective = 100B + 500M, consumed = 500M
+    let (wrong_base_out, _, _) = buy_base_piecewise(
+        100_000_000,
+        &default_quote().ask_prices,
+        VAULT_INITIAL_BALANCE + 500_000_000,
+        500_000_000,
+    )
+    .unwrap();
+    assert_ne!(
+        expected_base_out, wrong_base_out,
+        "test is meaningful: reset changes swap output"
+    );
+    assert_eq!(
+        final_aux.ask_accumulated, expected_ask_acc,
+        "ask_accumulated must match post-reset math (using vault_balance, not vault+old_acc)",
+    );
+    let user_base_amount = read_token_amount_from_result(&result, &setup.user_base_key);
+    assert_eq!(
+        user_base_amount,
+        100_000_000_000 + expected_base_out,
+        "user received wrong base — oracle reset did not clear accumulated in math",
+    );
+}
+
+#[test]
+fn test_buy_sell_buy_math_replay() {
+    // Full local math replay of buy→sell→buy chain.
+    // Proves saturating_sub heal, vault deltas, and on-chain accumulated match piecewise math exactly.
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let aux = setup.default_aux();
+    let accounts = setup.build_accounts(&aux);
+
+    let buy_ix = setup.build_swap_instruction(0, 200_000_000, 0);
+    let sell_ix = setup.build_swap_instruction(1, 1_000_000_000, 0);
+    let buy2_ix = setup.build_swap_instruction(0, 150_000_000, 0);
+
+    let result = mollusk.process_and_validate_instruction_chain(
+        &[
+            (&buy_ix, &[Check::success()]),
+            (&sell_ix, &[Check::success()]),
+            (&buy2_ix, &[Check::success()]),
+        ],
+        &accounts,
+    );
+
+    let final_aux = read_aux_from_result(&result, &setup.envelope_key);
+    let base_vault_balance = read_token_amount_from_result(&result, &setup.base_vault_key);
+    let quote_vault_balance = read_token_amount_from_result(&result, &setup.quote_vault_key);
+
+    // Buy 1: effective = VAULT_INITIAL_BALANCE + 0, consumed = 0
+    let (base_bought_1, quote_used_1, ask_acc_1) =
+        buy_base_piecewise(200_000_000, &ASK_PRICES, VAULT_INITIAL_BALANCE, 0).unwrap();
+    let base_vault_1 = VAULT_INITIAL_BALANCE - base_bought_1;
+    let quote_vault_1 = VAULT_INITIAL_BALANCE + quote_used_1;
+    let bid_acc_1: u64 = 0; // 0u64.saturating_sub(quote_used_1) = 0
+
+    // Sell: effective = quote_vault_1 + bid_acc_1, consumed = bid_acc_1
+    let (quote_received, base_used, bid_acc_2) = sell_base_piecewise(
+        1_000_000_000,
+        &BID_PRICES,
+        quote_vault_1 + bid_acc_1,
+        bid_acc_1,
+    )
+    .unwrap();
+    let ask_acc_2 = ask_acc_1.saturating_sub(base_used);
+    let base_vault_2 = base_vault_1 + base_used;
+    let quote_vault_2 = quote_vault_1 - quote_received;
+
+    // Buy 2: effective = base_vault_2 + ask_acc_2, consumed = ask_acc_2
+    let (base_bought_2, quote_used_2, ask_acc_final) = buy_base_piecewise(
+        150_000_000,
+        &ASK_PRICES,
+        base_vault_2 + ask_acc_2,
+        ask_acc_2,
+    )
+    .unwrap();
+    let bid_acc_final = bid_acc_2.saturating_sub(quote_used_2);
+    let expected_base_vault = base_vault_2 - base_bought_2;
+    let expected_quote_vault = quote_vault_2 + quote_used_2;
+
+    assert_eq!(
+        final_aux.ask_accumulated, ask_acc_final,
+        "ask_accumulated mismatch after buy→sell→buy",
+    );
+    assert_eq!(
+        final_aux.bid_accumulated, bid_acc_final,
+        "bid_accumulated mismatch after buy→sell→buy",
+    );
+    assert_eq!(
+        base_vault_balance, expected_base_vault,
+        "base vault mismatch after buy→sell→buy"
+    );
+    assert_eq!(
+        quote_vault_balance, expected_quote_vault,
+        "quote vault mismatch after buy→sell→buy"
+    );
+
+    println!("buy→sell→buy math replay passed:");
+    println!(
+        "  buy1: base_bought={} quote_used={} ask_acc={}",
+        base_bought_1, quote_used_1, ask_acc_1
+    );
+    println!(
+        "  sell: quote_received={} base_used={} bid_acc={}",
+        quote_received, base_used, bid_acc_2
+    );
+    println!(
+        "  buy2: base_bought={} ask_acc_final={} bid_acc_final={}",
+        base_bought_2, ask_acc_final, bid_acc_final
+    );
+}
+
+#[test]
+fn test_oracle_reset_depleted_vault() {
+    // Oracle reset clears backoff; effective_total becomes vault_balance (not vault+accumulated).
+    // A depleted vault (small inventory) gives a smaller/cheaper book post-reset.
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let base_vault_balance: u64 = 1_000_000_000; // 1B (10x smaller than default 100B)
+
+    let mut aux = setup.default_aux();
+    aux.ask_accumulated = 500_000_000; // simulates prior buys
+    aux.accumulated_at_seq = 1; // matches oracle seq=1 → triggers reset when seq advances to 2
+
+    // Build accounts with custom base vault balance
+    let quote = default_quote();
+    let envelope = create_prop_amm_envelope(&setup.authority, &setup.pool_pda, &quote, &aux);
+    let accounts: Vec<(Address, Account)> = vec![
+        // Inline account construction mirrors build_accounts but overrides base_vault_balance.
+        // If build_accounts account ordering changes, update this list too.
+        (setup.user, create_funded_account(1_000_000_000)),
+        (setup.authority, create_funded_account(1_000_000_000)),
+        (setup.envelope_key, envelope),
+        (
+            setup.user_base_key,
+            create_token_account(&setup.base_mint_key, &setup.user, 100_000_000_000),
+        ),
+        (
+            setup.user_quote_key,
+            create_token_account(&setup.quote_mint_key, &setup.user, 100_000_000_000),
+        ),
+        (
+            setup.base_vault_key,
+            create_token_account(&setup.base_mint_key, &setup.pool_pda, base_vault_balance),
+        ),
+        (
+            setup.quote_vault_key,
+            create_token_account(
+                &setup.quote_mint_key,
+                &setup.pool_pda,
+                VAULT_INITIAL_BALANCE,
+            ),
+        ),
+        (setup.base_mint_key, create_mint_account(9)),
+        (setup.quote_mint_key, create_mint_account(6)),
+        (
+            SPL_TOKEN_ID,
+            create_program_account_loader_v3(&SPL_TOKEN_ID),
+        ),
+        (C_U_SOON_ID, create_program_account_loader_v3(&C_U_SOON_ID)),
+        (setup.pool_pda, create_funded_account(0)),
+        (setup.padding_key, create_funded_account(0)),
+        (
+            setup.authority_base_key,
+            create_token_account(&setup.base_mint_key, &setup.authority, 0),
+        ),
+        (
+            setup.authority_quote_key,
+            create_token_account(&setup.quote_mint_key, &setup.authority, 0),
+        ),
+    ];
+
+    // Advance oracle to seq 2 → triggers accumulated reset on next swap
+    let update_ix = setup.build_oracle_fast_update_instruction(2, &default_quote());
+    let swap_ix = setup.build_swap_instruction(0, 100_000_000, 0); // 100M quote in
+
+    let result = mollusk.process_and_validate_instruction_chain(
+        &[
+            (&update_ix, &[Check::success()]),
+            (&swap_ix, &[Check::success()]),
+        ],
+        &accounts,
+    );
+
+    let final_aux = read_aux_from_result(&result, &setup.envelope_key);
+    let user_base_amount = read_token_amount_from_result(&result, &setup.user_base_key);
+
+    // Post-reset: effective = vault_balance = 1B, consumed = 0
+    let (expected_base_out, _, expected_ask_acc) =
+        buy_base_piecewise(100_000_000, &ASK_PRICES, base_vault_balance, 0).unwrap();
+    // Pre-reset (wrong): effective = 1B + 500M = 1.5B, consumed = 500M
+    let (wrong_base_out, _, _) = buy_base_piecewise(
+        100_000_000,
+        &ASK_PRICES,
+        base_vault_balance + 500_000_000,
+        500_000_000,
+    )
+    .unwrap();
+
+    assert_ne!(
+        expected_base_out, wrong_base_out,
+        "test is meaningful: reset changes swap output with depleted vault",
+    );
+    assert_eq!(
+        final_aux.ask_accumulated, expected_ask_acc,
+        "ask_accumulated must match post-reset math (fresh vault_balance)",
+    );
+    assert_eq!(
+        user_base_amount,
+        100_000_000_000 + expected_base_out,
+        "user received wrong base — oracle reset did not use vault_balance as effective",
+    );
+
+    println!("oracle reset with depleted vault: effective = vault_balance (by design)");
+    println!(
+        "  pre-reset:  effective={}  wrong_out={}",
+        base_vault_balance + 500_000_000,
+        wrong_base_out
+    );
+    println!(
+        "  post-reset: effective={}  correct_out={}",
+        base_vault_balance, expected_base_out
+    );
+}
+
+#[test]
+fn test_swap_then_withdraw_then_swap() {
+    // Proves vault is read fresh after a withdraw (vault is ground truth, not cached).
+    let mollusk = setup_mollusk();
+    let setup = SwapSetup::new();
+    let aux = setup.default_aux();
+    let accounts = setup.build_accounts(&aux);
+
+    let quote_in_1: u64 = 100_000_000; // 100M quote
+    let buy_ix_1 = setup.build_swap_instruction(0, quote_in_1, 0);
+
+    // Replay math for buy 1: effective = 100B + 0
+    let (base_bought_1, _, ask_acc_1) =
+        buy_base_piecewise(quote_in_1, &ASK_PRICES, VAULT_INITIAL_BALANCE, 0).unwrap();
+    let base_vault_1 = VAULT_INITIAL_BALANCE - base_bought_1;
+
+    let withdraw_amount: u64 = 50_000_000_000; // 50B base
+    let withdraw_ix = setup.build_withdraw_instruction(0, withdraw_amount);
+    assert!(
+        base_vault_1 >= withdraw_amount,
+        "test setup: vault insufficient for withdraw"
+    );
+    let base_vault_after_withdraw = base_vault_1 - withdraw_amount;
+
+    let quote_in_2: u64 = 100_000_000; // 100M quote
+    let buy_ix_2 = setup.build_swap_instruction(0, quote_in_2, 0);
+
+    let result = mollusk.process_and_validate_instruction_chain(
+        &[
+            (&buy_ix_1, &[Check::success()]),
+            (&withdraw_ix, &[Check::success()]),
+            (&buy_ix_2, &[Check::success()]),
+        ],
+        &accounts,
+    );
+
+    let final_aux = read_aux_from_result(&result, &setup.envelope_key);
+    let base_vault_final = read_token_amount_from_result(&result, &setup.base_vault_key);
+    let user_base_amount = read_token_amount_from_result(&result, &setup.user_base_key);
+
+    // Buy 2: effective = base_vault_after_withdraw + ask_acc_1 (vault read fresh post-withdraw)
+    let effective_2 = base_vault_after_withdraw + ask_acc_1;
+    let (base_bought_2, _, ask_acc_final) =
+        buy_base_piecewise(quote_in_2, &ASK_PRICES, effective_2, ask_acc_1).unwrap();
+
+    assert_eq!(
+        user_base_amount,
+        100_000_000_000 + base_bought_1 + base_bought_2,
+        "user should have initial + bought_1 + bought_2 base tokens",
+    );
+    assert_eq!(
+        base_vault_final,
+        base_vault_after_withdraw - base_bought_2,
+        "vault balance should reflect withdraw and second buy",
+    );
+    assert_eq!(
+        final_aux.ask_accumulated, ask_acc_final,
+        "ask_accumulated should match replay with post-withdraw vault balance",
+    );
+    assert_eq!(
+        final_aux.bid_accumulated, 0,
+        "bid_accumulated should be 0 after buy-only chain"
+    );
+    // quote_vault not asserted: quote_used_1 is discarded above (`_`); the test focuses
+    // on base-side vault freshness after withdraw, not the full cross-side replay.
+
+    println!("swap→withdraw→swap vault-freshness test passed:");
+    println!(
+        "  base_bought_1={} withdraw={} base_vault_after_withdraw={}",
+        base_bought_1, withdraw_amount, base_vault_after_withdraw
+    );
+    println!(
+        "  effective_2={} base_bought_2={} ask_acc_final={}",
+        effective_2, base_bought_2, ask_acc_final
+    );
 }
