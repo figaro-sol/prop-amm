@@ -4,14 +4,17 @@ use pinocchio::{
     AccountView, Address, ProgramResult,
 };
 
-use c_u_soon::{Envelope, TypeHash};
+use c_u_soon::TypeHash;
 use c_u_soon_cpi::{next_sequence, UpdateAuxiliaryDelegatedMultiRange};
 
 use crate::{
     error::PropAmmError,
     math::{buy_base_piecewise, sell_base_piecewise},
     pda::POOL_SEED,
-    state::{PropAmmAux, PropAmmAuxProgram, PropAmmAuxProgramDelta, PropAmmQuote},
+    state::{
+        load_quote_aux, load_validated_envelope, PropAmmAux, PropAmmAuxProgram,
+        PropAmmAuxProgramDelta,
+    },
     token::{get_mint_decimals, get_token_account_balance, transfer_tokens},
 };
 
@@ -110,27 +113,8 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
         return Err(PropAmmError::ZeroAmount.into());
     }
 
-    // Envelope must be owned by c_u_soon program
-    if !envelope_account.owned_by(c_u_soon_program.address()) {
-        return Err(PropAmmError::InvalidOwner.into());
-    }
-
-    // Read envelope
-    let envelope_data = envelope_account.try_borrow()?;
-    if envelope_data.len() < Envelope::SIZE {
-        return Err(PropAmmError::InvalidEnvelope.into());
-    }
-    let envelope: &Envelope = bytemuck::from_bytes(&envelope_data[..Envelope::SIZE]);
-
-    // Read oracle prices
-    let quote: &PropAmmQuote = envelope
-        .oracle::<PropAmmQuote>()
-        .ok_or(PropAmmError::InvalidEnvelope)?;
-
-    // Read aux state
-    let aux: &PropAmmAux = envelope
-        .aux::<PropAmmAux>()
-        .ok_or(PropAmmError::InvalidEnvelope)?;
+    let envelope = load_validated_envelope(envelope_account, c_u_soon_program)?;
+    let (quote, aux) = load_quote_aux(&envelope)?;
 
     // Validate pool is active
     if aux.is_active == 0 {
@@ -138,18 +122,18 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
     }
 
     // Validate mints
-    if base_mint.address().as_ref() != &aux.base_mint {
+    if base_mint.address().as_ref() != aux.base_mint {
         return Err(PropAmmError::InvalidMint.into());
     }
-    if quote_mint.address().as_ref() != &aux.quote_mint {
+    if quote_mint.address().as_ref() != aux.quote_mint {
         return Err(PropAmmError::InvalidMint.into());
     }
 
     // Validate vaults
-    if base_vault.address().as_ref() != &aux.base_vault {
+    if base_vault.address().as_ref() != aux.base_vault {
         return Err(PropAmmError::InvalidTokenAccount.into());
     }
-    if quote_vault.address().as_ref() != &aux.quote_vault {
+    if quote_vault.address().as_ref() != aux.quote_vault {
         return Err(PropAmmError::InvalidTokenAccount.into());
     }
 
@@ -235,9 +219,6 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
         }
     };
 
-    // Drop envelope borrow before CPI
-    drop(envelope_data);
-
     // Build delta with only the changed #[program] fields
     let mut delta = PropAmmAuxProgramDelta::new();
     delta
@@ -245,6 +226,9 @@ pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]
         .set_ask_accumulated(updated_aux.ask_accumulated)
         .set_accumulated_at_seq(updated_aux.accumulated_at_seq);
     let write_specs = delta.to_write_specs();
+
+    // Drop envelope borrow before CPI
+    drop(envelope);
 
     // Token transfers
     let bump_seed = [pool_authority_bump];

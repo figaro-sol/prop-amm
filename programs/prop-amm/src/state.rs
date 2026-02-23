@@ -1,6 +1,9 @@
 use bytemuck::{Pod, Zeroable};
 use c_u_later::CuLater;
-use c_u_soon::TypeHash;
+use c_u_soon::{Envelope, TypeHash};
+use pinocchio::{account::Ref, error::ProgramError, AccountView};
+
+use crate::error::PropAmmError;
 
 pub const SCALE: u64 = 1_000_000_000;
 pub const NUM_PRICE_POINTS: usize = 7;
@@ -68,6 +71,31 @@ impl PiecewiseBookSide {
     pub fn quantity_per_segment(&self) -> u64 {
         self.total_quantity / NUM_SEGMENTS as u64
     }
+}
+
+pub fn load_validated_envelope<'a>(
+    envelope_account: &'a AccountView,
+    c_u_soon_program: &AccountView,
+) -> Result<Ref<'a, Envelope>, ProgramError> {
+    // Envelope must be owned by c_u_soon program
+    if !envelope_account.owned_by(c_u_soon_program.address()) {
+        return Err(PropAmmError::InvalidOwner.into());
+    }
+
+    Ref::try_map(envelope_account.try_borrow()?, bytemuck::try_from_bytes)
+        .map_err(|_| PropAmmError::InvalidEnvelope.into())
+}
+pub fn load_quote_aux(envelope: &Envelope) -> Result<(&PropAmmQuote, &PropAmmAux), ProgramError> {
+    // Read oracle prices
+    let quote = envelope
+        .oracle::<PropAmmQuote>()
+        .ok_or(PropAmmError::InvalidEnvelope)?;
+
+    // Read aux state
+    let aux: &PropAmmAux = envelope
+        .aux::<PropAmmAux>()
+        .ok_or(PropAmmError::InvalidEnvelope)?;
+    Ok((quote, aux))
 }
 
 #[cfg(test)]

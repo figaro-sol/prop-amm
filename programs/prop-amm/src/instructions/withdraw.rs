@@ -4,12 +4,10 @@ use pinocchio::{
     AccountView, Address, ProgramResult,
 };
 
-use c_u_soon::Envelope;
-
 use crate::{
     error::PropAmmError,
     pda::POOL_SEED,
-    state::PropAmmAux,
+    state::{load_quote_aux, load_validated_envelope},
     token::{get_mint_decimals, get_token_account_balance, transfer_tokens},
 };
 
@@ -77,27 +75,8 @@ pub fn process_withdraw(
         return Err(PropAmmError::ZeroAmount.into());
     }
 
-    // Envelope must be owned by c_u_soon program
-    if !envelope_account.owned_by(c_u_soon_program.address()) {
-        return Err(PropAmmError::InvalidOwner.into());
-    }
-
-    // Read envelope
-    let envelope_data = envelope_account.try_borrow()?;
-    if envelope_data.len() < Envelope::SIZE {
-        return Err(PropAmmError::InvalidEnvelope.into());
-    }
-    let envelope: &Envelope = bytemuck::from_bytes(&envelope_data[..Envelope::SIZE]);
-
-    // Verify authority
-    if authority.address() != &envelope.authority {
-        return Err(PropAmmError::Unauthorized.into());
-    }
-
-    // Read aux state
-    let aux: &PropAmmAux = envelope
-        .aux::<PropAmmAux>()
-        .ok_or(PropAmmError::InvalidEnvelope)?;
+    let envelope = load_validated_envelope(envelope_account, c_u_soon_program)?;
+    let (_, aux) = load_quote_aux(&envelope)?;
 
     // Validate pool_authority_pda
     if pool_authority_pda.address() != &envelope.delegation_authority {
@@ -107,18 +86,18 @@ pub fn process_withdraw(
     // Validate mint and vault identity
     match ix_data.side {
         TokenSide::Base => {
-            if mint.address().as_ref() != &aux.base_mint {
+            if mint.address().as_ref() != aux.base_mint {
                 return Err(PropAmmError::InvalidMint.into());
             }
-            if vault.address().as_ref() != &aux.base_vault {
+            if vault.address().as_ref() != aux.base_vault {
                 return Err(PropAmmError::InvalidTokenAccount.into());
             }
         }
         TokenSide::Quote => {
-            if mint.address().as_ref() != &aux.quote_mint {
+            if mint.address().as_ref() != aux.quote_mint {
                 return Err(PropAmmError::InvalidMint.into());
             }
-            if vault.address().as_ref() != &aux.quote_vault {
+            if vault.address().as_ref() != aux.quote_vault {
                 return Err(PropAmmError::InvalidTokenAccount.into());
             }
         }
@@ -130,7 +109,7 @@ pub fn process_withdraw(
 
     let decimals = get_mint_decimals(mint)?;
 
-    drop(envelope_data);
+    drop(envelope);
 
     // Vault balance is ground truth: withdraw only what is actually there
     let vault_balance = get_token_account_balance(vault)?;
