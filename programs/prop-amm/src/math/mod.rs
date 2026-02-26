@@ -113,11 +113,8 @@ pub fn buy_base_with_quote(
     // B = k/SCALE × (sqrt(P_L² + 2×C×SCALE²/k) - P_L)
     // where C = quote_in, k = Q×SCALE/range, P_L = lower_price
     // term = 2 × quote_in × SCALE² / k
-    let term = (2u128)
-        * (quote_in as u128)
-        * (PRICE_SCALE as u128)
-        * (PRICE_SCALE as u128)
-        / (k as u128);
+    let term =
+        (2u128) * (quote_in as u128) * (PRICE_SCALE as u128) * (PRICE_SCALE as u128) / (k as u128);
 
     let under_sqrt = p_lower_sq.checked_add(term)?;
 
@@ -182,9 +179,7 @@ pub fn sell_base_for_quote(
 
     // Convert quote liquidity to base equivalent at average price
     // base_equiv = quote_quantity × SCALE / avg_price
-    let base_equiv_128 = (quote_quantity as u128)
-        * (PRICE_SCALE as u128)
-        / (avg_price as u128);
+    let base_equiv_128 = (quote_quantity as u128) * (PRICE_SCALE as u128) / (avg_price as u128);
     let base_equiv = base_equiv_128 as u64;
 
     // Cap base_in to what liquidity can absorb
@@ -245,24 +240,16 @@ mod tests {
 
     #[test]
     fn test_buy_zero() {
-        let (bought, new_lower) = buy_base_with_quote(
-            0,
-            1_000_000_000,
-            200 * PRICE_SCALE,
-            300 * PRICE_SCALE
-        ).unwrap();
+        let (bought, new_lower) =
+            buy_base_with_quote(0, 1_000_000_000, 200 * PRICE_SCALE, 300 * PRICE_SCALE).unwrap();
         assert_eq!(bought, 0);
         assert_eq!(new_lower, 200 * PRICE_SCALE);
     }
 
     #[test]
     fn test_sell_zero() {
-        let (received, new_upper) = sell_base_for_quote(
-            0,
-            1_000_000_000,
-            100 * PRICE_SCALE,
-            200 * PRICE_SCALE
-        ).unwrap();
+        let (received, new_upper) =
+            sell_base_for_quote(0, 1_000_000_000, 100 * PRICE_SCALE, 200 * PRICE_SCALE).unwrap();
         assert_eq!(received, 0);
         assert_eq!(new_upper, 200 * PRICE_SCALE);
     }
@@ -274,7 +261,7 @@ mod tests {
         // Expected: get some base, price between 2 and 3
 
         let base_qty = 100_000_000; // 1 token at 8 decimals
-        let quote_in = 10_000_000;  // ~0.1 quote tokens at 8 decimals
+        let quote_in = 10_000_000; // ~0.1 quote tokens at 8 decimals
         let lower = 2 * PRICE_SCALE;
         let upper = 3 * PRICE_SCALE;
 
@@ -287,14 +274,32 @@ mod tests {
         assert!(bought > 0, "bought: {}", bought);
 
         // Price should have increased but stay in range
-        assert!(new_lower >= lower, "new_lower {} < lower {}", new_lower, lower);
-        assert!(new_lower <= upper, "new_lower {} > upper {}", new_lower, upper);
+        assert!(
+            new_lower >= lower,
+            "new_lower {} < lower {}",
+            new_lower,
+            lower
+        );
+        assert!(
+            new_lower <= upper,
+            "new_lower {} > upper {}",
+            new_lower,
+            upper
+        );
 
         // Implied price should be reasonable (between 2 and 3)
         if bought > 0 {
             let implied_price = (quote_in as f64) / (bought as f64) * (PRICE_SCALE as f64);
-            assert!(implied_price >= 1.5 * (PRICE_SCALE as f64), "price too low: {}", implied_price / PRICE_SCALE as f64);
-            assert!(implied_price <= 4.0 * (PRICE_SCALE as f64), "price too high: {}", implied_price / PRICE_SCALE as f64);
+            assert!(
+                implied_price >= 1.5 * (PRICE_SCALE as f64),
+                "price too low: {}",
+                implied_price / PRICE_SCALE as f64
+            );
+            assert!(
+                implied_price <= 4.0 * (PRICE_SCALE as f64),
+                "price too high: {}",
+                implied_price / PRICE_SCALE as f64
+            );
         }
     }
 }

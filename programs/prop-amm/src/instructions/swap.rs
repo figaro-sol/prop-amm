@@ -1,41 +1,28 @@
-//! Swap Instruction
-//!
-//! Executes buy or sell swaps against the pool using piecewise linear curves.
-//! Supports both SPL Token and Token-2022 tokens.
-//!
-//! ## Price Convention
-//! Prices are stored as native-ratio scaled values:
-//! `price = (quote_native / base_native) * PRICE_SCALE`
-//!
-//! Each side has 7 price points creating 6 segments with equal quantity distribution.
-
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::Signer,
-    log::sol_log_data,
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    seeds, ProgramResult,
+    cpi::{Seed, Signer},
+    error::ProgramError,
+    AccountView, Address, ProgramResult,
 };
+
+use c_u_soon::TypeHash;
+use c_u_soon_cpi::{next_sequence, UpdateAuxiliaryDelegatedMultiRange};
 
 use crate::{
     error::PropAmmError,
     math::{buy_base_piecewise, sell_base_piecewise},
     pda::POOL_SEED,
-    state::Pool,
-    token::{get_mint_decimals, transfer_tokens},
+    state::{
+        load_quote_aux, load_validated_envelope, PropAmmAux, PropAmmAuxProgram,
+        PropAmmAuxProgramDelta,
+    },
+    token::{get_mint_decimals, get_token_account_balance, transfer_tokens},
 };
 
 /// Swap direction
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SwapDirection {
-    /// Buy base token with quote token (e.g., USDC -> NVDAX)
-    /// Consumes ask side liquidity
     BuyBaseWithQuote = 0,
-
-    /// Sell base token for quote token (e.g., NVDAX -> USDC)
-    /// Consumes bid side liquidity
     SellBaseForQuote = 1,
 }
 
@@ -53,29 +40,21 @@ impl SwapDirection {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SwapData {
-    /// Direction of swap
     pub direction: SwapDirection,
-    /// Amount input (native token units)
-    /// - BuyBaseWithQuote: quote token units to spend
-    /// - SellBaseForQuote: base token units to sell
     pub amount_in: u64,
-    /// Minimum amount out (native token units) - slippage protection
     pub min_amount_out: u64,
 }
 
 impl SwapData {
     pub const SIZE: usize = 1 + 8 + 8; // 17 bytes
 
-    /// Parse from bytes
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < Self::SIZE {
             return None;
         }
-
         let direction = SwapDirection::try_from_u8(data[0])?;
         let amount_in = u64::from_le_bytes(data[1..9].try_into().ok()?);
         let min_amount_out = u64::from_le_bytes(data[9..17].try_into().ok()?);
-
         Some(Self {
             direction,
             amount_in,
@@ -87,197 +66,186 @@ impl SwapData {
 /// Process Swap instruction
 ///
 /// Accounts:
-/// 0. `[signer]` User - Trader
-/// 1. `[writable]` Pool - Pool account
-/// 2. `[writable]` User Base Account - User's base token account
-/// 3. `[writable]` User Quote Account - User's quote token account
-/// 4. `[writable]` Pool Base Vault - Pool's base token account
-/// 5. `[writable]` Pool Quote Vault - Pool's quote token account
-/// 6. `[]` Base Mint - Base token mint
-/// 7. `[]` Quote Mint - Quote token mint
-/// 8. `[]` Base Token Program - SPL Token or Token-2022
-/// 9. `[]` Quote Token Program - SPL Token or Token-2022
-pub fn process_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    // Parse instruction data
+///  0. [signer]    user
+///  1. [writable]  envelope            — c_u_soon envelope
+///  2. [writable]  user_base_account
+///  3. [writable]  user_quote_account
+///  4. [writable]  base_vault
+///  5. [writable]  quote_vault
+///  6. []          base_mint
+///  7. []          quote_mint
+///  8. []          base_token_program
+///  9. []          quote_token_program
+/// 10. []          c_u_soon_program
+/// 11. []          pool_authority_pda   — delegation_authority, for PDA signing
+pub fn process_swap(_program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let ix_data = SwapData::from_bytes(data).ok_or(ProgramError::InvalidInstructionData)?;
 
-    // Validate accounts
-    if accounts.len() < 10 {
+    if accounts.len() < 12 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
 
     let user = &accounts[0];
-    let pool_account = &accounts[1];
+    let envelope_account = &accounts[1];
     let user_base_account = &accounts[2];
     let user_quote_account = &accounts[3];
-    let pool_base_vault = &accounts[4];
-    let pool_quote_vault = &accounts[5];
+    let base_vault = &accounts[4];
+    let quote_vault = &accounts[5];
     let base_mint = &accounts[6];
     let quote_mint = &accounts[7];
     let base_token_program = &accounts[8];
     let quote_token_program = &accounts[9];
+    let c_u_soon_program = &accounts[10];
+    let pool_authority_pda = &accounts[11];
 
-    // User must be signer
     if !user.is_signer() {
         return Err(PropAmmError::NotSigner.into());
     }
-
-    // Validate writable accounts
-    if !pool_account.is_writable()
+    if !envelope_account.is_writable()
         || !user_base_account.is_writable()
         || !user_quote_account.is_writable()
-        || !pool_base_vault.is_writable()
-        || !pool_quote_vault.is_writable()
+        || !base_vault.is_writable()
+        || !quote_vault.is_writable()
     {
         return Err(PropAmmError::NotWritable.into());
     }
-
-    // Pool must be owned by this program
-    if unsafe { pool_account.owner() } != program_id {
-        return Err(PropAmmError::InvalidOwner.into());
-    }
-
-    // Validate amount
     if ix_data.amount_in == 0 {
         return Err(PropAmmError::ZeroAmount.into());
     }
 
-    // Load pool
-    let pool_data = pool_account.try_borrow_data()?;
-    if pool_data.len() < Pool::SIZE {
-        return Err(PropAmmError::AccountDataTooSmall.into());
-    }
+    let envelope = load_validated_envelope(envelope_account, c_u_soon_program)?;
+    let (quote, aux) = load_quote_aux(&envelope)?;
 
-    let mut pool = Pool::from_bytes(&pool_data).ok_or(PropAmmError::InvalidDiscriminator)?;
-
-    if !pool.is_valid_discriminator() {
-        return Err(PropAmmError::InvalidDiscriminator.into());
-    }
-
-    // Check pool is active
-    if !pool.is_active {
+    // Validate pool is active
+    if aux.is_active == 0 {
         return Err(PropAmmError::PoolNotActive.into());
     }
 
-    // Validate mints match pool
-    if base_mint.key() != &pool.base_mint {
+    // Validate mints
+    if base_mint.address().as_ref() != aux.base_mint {
         return Err(PropAmmError::InvalidMint.into());
     }
-    if quote_mint.key() != &pool.quote_mint {
+    if quote_mint.address().as_ref() != aux.quote_mint {
         return Err(PropAmmError::InvalidMint.into());
     }
 
-    // Validate vaults match pool
-    if pool_base_vault.key() != &pool.base_vault {
+    // Validate vaults
+    if base_vault.address().as_ref() != aux.base_vault {
         return Err(PropAmmError::InvalidTokenAccount.into());
     }
-    if pool_quote_vault.key() != &pool.quote_vault {
+    if quote_vault.address().as_ref() != aux.quote_vault {
         return Err(PropAmmError::InvalidTokenAccount.into());
     }
 
-    // Get decimals for transfer_checked (required by SPL Token)
+    // Validate pool_authority_pda is the delegation_authority
+    if pool_authority_pda.address() != &envelope.delegation_authority {
+        return Err(PropAmmError::InvalidPda.into());
+    }
+
+    // Snapshot immutable fields for PDA signing and mutable state for swap math
+    let base_mint_bytes = aux.base_mint;
+    let quote_mint_bytes = aux.quote_mint;
+    let pool_authority_bump = aux.pool_authority_bump;
+    let mut updated_aux: PropAmmAux = *aux;
+    let oracle_sequence = envelope.oracle_state.sequence;
+    let program_aux_sequence = envelope.program_aux_sequence;
+
+    // Get decimals and vault balances before dropping borrow
     let base_decimals = get_mint_decimals(base_mint)?;
     let quote_decimals = get_mint_decimals(quote_mint)?;
+    let base_vault_balance = get_token_account_balance(base_vault)?;
+    let quote_vault_balance = get_token_account_balance(quote_vault)?;
 
-    drop(pool_data);
+    // Execute swap through typed wrapper (program-only field access)
+    let (transfer_in_amount, transfer_out_amount) = {
+        let mut aux_w = PropAmmAuxProgram::from_mut(&mut updated_aux);
 
-    // Execute swap using piecewise math
-    let (transfer_in_amount, transfer_out_amount) = match ix_data.direction {
-        SwapDirection::BuyBaseWithQuote => {
-            // User spends quote to buy base (consumes ask side)
-            let (base_bought, quote_used, new_consumed) = buy_base_piecewise(
-                ix_data.amount_in,
-                &pool.ask_side.prices,
-                pool.ask_side.total_quantity,
-                pool.ask_side.consumed,
-            )
-            .ok_or(PropAmmError::MathOverflow)?;
-
-            // Check slippage
-            if base_bought < ix_data.min_amount_out {
-                return Err(PropAmmError::SlippageExceeded.into());
-            }
-
-            // Update pool state
-            pool.ask_side.consumed = new_consumed;
-
-            // Credit incoming USDC to bid side
-            // FIRST: heal consumed (move curve back toward spread)
-            // THEN: add remainder to total only after consumed hits 0
-            if quote_used > 0 {
-                if pool.bid_side.consumed >= quote_used {
-                    // All incoming heals consumed
-                    pool.bid_side.consumed -= quote_used;
-                } else {
-                    // Partial heal + add remainder to total
-                    let remainder = quote_used - pool.bid_side.consumed;
-                    pool.bid_side.consumed = 0;
-                    pool.bid_side.total_quantity += remainder;
-                }
-            }
-
-            // Transfer: User sends quote, receives base
-            (quote_used, base_bought)
+        // Oracle freshness: reset accumulated on new oracle sequence.
+        if oracle_sequence > aux_w.accumulated_at_seq {
+            *aux_w.bid_accumulated_mut() = 0;
+            *aux_w.ask_accumulated_mut() = 0;
+            *aux_w.accumulated_at_seq_mut() = oracle_sequence;
         }
-        SwapDirection::SellBaseForQuote => {
-            // User sells base for quote (consumes bid side)
-            let (quote_received, base_used, new_consumed) = sell_base_piecewise(
-                ix_data.amount_in,
-                &pool.bid_side.prices,
-                pool.bid_side.total_quantity,
-                pool.bid_side.consumed,
-            )
-            .ok_or(PropAmmError::MathOverflow)?;
 
-            // Check slippage
-            if quote_received < ix_data.min_amount_out {
-                return Err(PropAmmError::SlippageExceeded.into());
-            }
+        match ix_data.direction {
+            SwapDirection::BuyBaseWithQuote => {
+                // User spends quote to buy base (consumes ask side).
+                // Vault balance is ground truth: effective = base_vault + ask_accumulated.
+                let effective_total = base_vault_balance
+                    .checked_add(aux_w.ask_accumulated)
+                    .ok_or(PropAmmError::MathOverflow)?;
 
-            // Update pool state
-            pool.bid_side.consumed = new_consumed;
+                let (base_bought, quote_used, new_consumed) = buy_base_piecewise(
+                    ix_data.amount_in,
+                    &quote.ask_prices,
+                    effective_total,
+                    aux_w.ask_accumulated,
+                )
+                .ok_or(PropAmmError::MathOverflow)?;
 
-            // Credit incoming NVDAX to ask side
-            // FIRST: heal consumed (move curve back toward spread)
-            // THEN: add remainder to total only after consumed hits 0
-            if base_used > 0 {
-                if pool.ask_side.consumed >= base_used {
-                    // All incoming heals consumed
-                    pool.ask_side.consumed -= base_used;
-                } else {
-                    // Partial heal + add remainder to total
-                    let remainder = base_used - pool.ask_side.consumed;
-                    pool.ask_side.consumed = 0;
-                    pool.ask_side.total_quantity += remainder;
+                if base_bought < ix_data.min_amount_out {
+                    return Err(PropAmmError::SlippageExceeded.into());
                 }
-            }
 
-            // Transfer: User sends base, receives quote
-            (base_used, quote_received)
+                *aux_w.ask_accumulated_mut() = new_consumed;
+                *aux_w.bid_accumulated_mut() = aux_w.bid_accumulated.saturating_sub(quote_used);
+
+                (quote_used, base_bought)
+            }
+            SwapDirection::SellBaseForQuote => {
+                // User sells base for quote (consumes bid side).
+                // Vault balance is ground truth: effective = quote_vault + bid_accumulated.
+                let effective_total = quote_vault_balance
+                    .checked_add(aux_w.bid_accumulated)
+                    .ok_or(PropAmmError::MathOverflow)?;
+
+                let (quote_received, base_used, new_consumed) = sell_base_piecewise(
+                    ix_data.amount_in,
+                    &quote.bid_prices,
+                    effective_total,
+                    aux_w.bid_accumulated,
+                )
+                .ok_or(PropAmmError::MathOverflow)?;
+
+                if quote_received < ix_data.min_amount_out {
+                    return Err(PropAmmError::SlippageExceeded.into());
+                }
+
+                *aux_w.bid_accumulated_mut() = new_consumed;
+                *aux_w.ask_accumulated_mut() = aux_w.ask_accumulated.saturating_sub(base_used);
+
+                (base_used, quote_received)
+            }
         }
     };
 
-    // Write updated pool state
-    let pool_bytes = pool.to_bytes();
-    let mut pool_data = pool_account.try_borrow_mut_data()?;
-    pool_data[..Pool::SIZE].copy_from_slice(&pool_bytes);
-    drop(pool_data);
+    // Build delta with only the changed #[program] fields
+    let mut delta = PropAmmAuxProgramDelta::new();
+    delta
+        .set_bid_accumulated(updated_aux.bid_accumulated)
+        .set_ask_accumulated(updated_aux.ask_accumulated)
+        .set_accumulated_at_seq(updated_aux.accumulated_at_seq);
+    let write_specs = delta.to_write_specs();
 
-    // Perform token transfers
-    let bump_seed = [pool.bump];
-    let pool_signer_seeds = seeds!(
-        POOL_SEED,
-        pool.base_mint.as_ref(),
-        pool.quote_mint.as_ref(),
-        &bump_seed
-    );
+    // Drop envelope borrow before CPI
+    drop(envelope);
+
+    // Token transfers
+    let bump_seed = [pool_authority_bump];
+    let pool_signer_seeds = [
+        Seed::from(POOL_SEED),
+        Seed::from(&base_mint_bytes),
+        Seed::from(&quote_mint_bytes),
+        Seed::from(&bump_seed),
+    ];
+    let signer = Signer::from(&pool_signer_seeds);
 
     match ix_data.direction {
         SwapDirection::BuyBaseWithQuote => {
-            // User sends quote to pool (user signs)
+            // User sends quote to vault (user signs)
             transfer_tokens(
                 user_quote_account,
-                pool_quote_vault,
+                quote_vault,
                 user,
                 quote_mint,
                 quote_token_program,
@@ -285,24 +253,23 @@ pub fn process_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
                 quote_decimals,
                 &[],
             )?;
-
-            // Pool sends base to user (PDA signs)
+            // Vault sends base to user (pool_authority_pda signs)
             transfer_tokens(
-                pool_base_vault,
+                base_vault,
                 user_base_account,
-                pool_account,
+                pool_authority_pda,
                 base_mint,
                 base_token_program,
                 transfer_out_amount,
                 base_decimals,
-                &[Signer::from(&pool_signer_seeds)],
+                &[signer],
             )?;
         }
         SwapDirection::SellBaseForQuote => {
-            // User sends base to pool (user signs)
+            // User sends base to vault (user signs)
             transfer_tokens(
                 user_base_account,
-                pool_base_vault,
+                base_vault,
                 user,
                 base_mint,
                 base_token_program,
@@ -310,31 +277,39 @@ pub fn process_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
                 base_decimals,
                 &[],
             )?;
-
-            // Pool sends quote to user (PDA signs)
+            // Vault sends quote to user (pool_authority_pda signs)
             transfer_tokens(
-                pool_quote_vault,
+                quote_vault,
                 user_quote_account,
-                pool_account,
+                pool_authority_pda,
                 quote_mint,
                 quote_token_program,
                 transfer_out_amount,
                 quote_decimals,
-                &[Signer::from(&pool_signer_seeds)],
+                &[signer],
             )?;
         }
     }
 
-    // Emit SwapEvent via sol_log_data for trade logging
-    // Data layout: discriminator(1) + user(32) + direction(1) + amount_in(8) + amount_out(8) = 50 bytes
-    let mut event_data = [0u8; 50];
-    event_data[0] = 6; // SwapEvent discriminator
-    event_data[1..33].copy_from_slice(user.key().as_ref());
-    event_data[33] = ix_data.direction as u8;
-    event_data[34..42].copy_from_slice(&transfer_in_amount.to_le_bytes());
-    event_data[42..50].copy_from_slice(&transfer_out_amount.to_le_bytes());
+    // CPI to c_u_soon: UpdateAuxiliaryDelegatedMultiRange
+    let cpi_sequence = next_sequence(program_aux_sequence)?;
 
-    sol_log_data(&[&event_data]);
+    let pool_signer_seeds2 = [
+        Seed::from(POOL_SEED),
+        Seed::from(&base_mint_bytes),
+        Seed::from(&quote_mint_bytes),
+        Seed::from(&bump_seed),
+    ];
+    let cpi_signer = Signer::from(&pool_signer_seeds2);
 
-    Ok(())
+    UpdateAuxiliaryDelegatedMultiRange {
+        envelope: envelope_account,
+        delegation_auth: pool_authority_pda,
+        padding: user,
+        program: c_u_soon_program,
+        metadata: PropAmmAux::METADATA.as_u64(),
+        sequence: cpi_sequence,
+        ranges: &write_specs,
+    }
+    .invoke_signed(&[cpi_signer])
 }

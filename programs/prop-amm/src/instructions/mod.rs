@@ -1,52 +1,42 @@
-//! Instruction Handlers
-//!
-//! Each instruction has its own module with processing logic.
-
-pub mod deposit;
-pub mod initialize;
-pub mod set_vaults;
 pub mod swap;
-pub mod swap_event;
-pub mod update_oracle;
 pub mod withdraw;
 
 /// Instruction discriminators (single byte)
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Instruction {
-    /// Initialize a new pool
-    Initialize = 0,
-
-    /// Update oracle (fair value and curve parameters)
-    UpdateOracle = 1,
-
     /// Execute a swap
-    Swap = 2,
-
-    /// Set vault addresses (one-time setup after initialize)
-    SetVaults = 3,
-
-    /// Deposit tokens into pool (authority only)
-    Deposit = 4,
+    Swap = 0,
 
     /// Withdraw tokens from pool (authority only)
-    Withdraw = 5,
-
-    /// Swap event (no-op, emitted via self-CPI for trade logging)
-    SwapEvent = 6,
+    Withdraw = 1,
 }
 
 impl Instruction {
-    /// Try to parse instruction from discriminator byte
     pub fn try_from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(Instruction::Initialize),
-            1 => Some(Instruction::UpdateOracle),
-            2 => Some(Instruction::Swap),
-            3 => Some(Instruction::SetVaults),
-            4 => Some(Instruction::Deposit),
-            5 => Some(Instruction::Withdraw),
-            6 => Some(Instruction::SwapEvent),
+            0 => Some(Instruction::Swap),
+            1 => Some(Instruction::Withdraw),
+            _ => None,
+        }
+    }
+}
+
+/// Token side for withdraw
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TokenSide {
+    /// Base token - affects ask_side
+    Base = 0,
+    /// Quote token - affects bid_side
+    Quote = 1,
+}
+
+impl TokenSide {
+    pub fn try_from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(TokenSide::Base),
+            1 => Some(TokenSide::Quote),
             _ => None,
         }
     }

@@ -1,0 +1,3 @@
+[submodule "c_u_soon"]
+	path = c_u_soon
+	url = git@github-figaro:figaro-sol/c_u_soon.git

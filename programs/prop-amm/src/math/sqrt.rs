@@ -174,7 +174,12 @@ mod tests {
         } else {
             expected - result
         };
-        assert!(error < expected / 10000, "error: {}, expected: {}", error, expected);
+        assert!(
+            error < expected / 10000,
+            "error: {}, expected: {}",
+            error,
+            expected
+        );
     }
 
     #[test]
@@ -189,7 +194,12 @@ mod tests {
         } else {
             expected - result
         };
-        assert!(error < expected / 10000, "result: {}, expected: {}", result, expected);
+        assert!(
+            error < expected / 10000,
+            "result: {}, expected: {}",
+            result,
+            expected
+        );
     }
 
     #[test]
@@ -205,7 +215,12 @@ mod tests {
         } else {
             expected - result
         };
-        assert!(error < expected / 10000, "result: {}, expected: {}", result, expected);
+        assert!(
+            error < expected / 10000,
+            "result: {}, expected: {}",
+            result,
+            expected
+        );
     }
 
     #[test]
@@ -228,7 +243,7 @@ mod tests {
             1 * PRICE_SCALE,
             100 * PRICE_SCALE,
             1000 * PRICE_SCALE,
-            150_000_000_000, // $150
+            150_000_000_000,    // $150
             18_000_000_000_000, // $18,000 (like BTC)
         ];
 
@@ -245,7 +260,11 @@ mod tests {
             assert!(
                 error <= max_error,
                 "sqrt({}) = {}, squared back = {}, error = {}, max = {}",
-                val, result, result_squared, error, max_error
+                val,
+                result,
+                result_squared,
+                error,
+                max_error
             );
         }
     }

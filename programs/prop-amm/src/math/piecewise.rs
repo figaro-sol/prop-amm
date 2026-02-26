@@ -85,7 +85,8 @@ pub fn buy_base_piecewise(
         }
 
         // Calculate quote actually used for this purchase
-        let quote_used = calculate_quote_for_base(base_bought, effective_lower, p_high, remaining_in_seg)?;
+        let quote_used =
+            calculate_quote_for_base(base_bought, effective_lower, p_high, remaining_in_seg)?;
 
         base_out = base_out.checked_add(base_bought)?;
         current_consumed = current_consumed.checked_add(base_bought)?;
@@ -179,7 +180,8 @@ pub fn sell_base_piecewise(
         }
 
         // Calculate base actually used for this sale
-        let base_used = calculate_base_for_quote(quote_received, p_low, effective_upper, remaining_in_seg)?;
+        let base_used =
+            calculate_base_for_quote(quote_received, p_low, effective_upper, remaining_in_seg)?;
 
         quote_out = quote_out.checked_add(quote_received)?;
         current_consumed = current_consumed.checked_add(quote_received)?;
@@ -360,7 +362,10 @@ mod tests {
         assert!(quote_out > 0, "quote_out should be > 0");
         assert!(base_used > 0, "base_used should be > 0");
         assert!(base_used <= base_in, "base_used should be <= base_in");
-        assert_eq!(new_consumed, quote_out, "new_consumed should equal quote_out");
+        assert_eq!(
+            new_consumed, quote_out,
+            "new_consumed should equal quote_out"
+        );
     }
 
     #[test]

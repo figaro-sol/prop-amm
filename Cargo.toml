@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["programs/prop-amm"]
+exclude = ["c_u_soon"]
 
 [workspace.dependencies]
-pinocchio = "0.8"
-pinocchio-token = "0.3"
-pinocchio-system = "0.2"
+pinocchio = { git = "ssh://git@github.com/figaro-sol/pinocchio.git", branch = "small_oracle" }
